@@ -1,0 +1,2405 @@
+---
+title: "Research against potential biases in UK residents who experiences stop and search by the police from 2021 until 2023”"
+author: "202075757"
+date: "AT 2023"
+output: html_document
+repository: https://github.com/Wendy1397/MY472_final_assignment.git
+
+Please Read README.md before run the code!!! This repository uses Git Large File Storage (LFS) to track large data files. Otherwise, please use the link to download data and replace them with LFS format data.
+
+
+---
+
+```{r setup, include=FALSE} 
+# this chunk contains code that sets global options for the entire .Rmd. 
+# we use include=FALSE to suppress it from the top of the document, but it will still appear in the appendix. 
+
+knitr::opts_chunk$set(echo = FALSE) # actually set the global chunk options. 
+# we set echo=FALSE to suppress code such that it by default does not appear throughout the document. 
+# note: this is different from .Rmd default
+```
+### 1. Introduction
+This report investigates potential biases in stop-and-search practices by UK police officers focusing on the impact of the individual's sex, ethnicity, age group, and the area of the police force.
+
+
+```{r}
+library(httr)
+library(jsonlite)
+library(tidyverse)
+library(jpeg) #to let us read .jpegs/.jpgs
+library(grid) #to let us plot images
+library(rvest)
+library(dplyr)
+library(DBI)
+library(ggplot2)
+options(repos = c(CRAN = "https://cran.rstudio.com/"))
+install.packages("scales")
+library(scales)
+library(tmap)
+library(classInt)
+library(sf)
+install.packages("ggspatial")
+library(ggspatial)
+library(gridExtra)
+```
+
+
+### 2.Data
+#### 1) API Utilization:
+##### Scraping stop-and-search data from the UK Police database.
+Ethnicity Classification: Implementing a "combined_ethnicity" variable, blending self-defined and officer-observed ethnicities. This approach addresses the issue of missing data (20% in 2023) in self-reported ethnicity.
+```{r}
+#use API to scarp data, get the date range: from 2020-12 until 2023-11,exactly 36 months, 3-year data
+crimes_street_dates_url <- "https://data.police.uk/api/crimes-street-dates"
+
+#fromJSON(crimes_street_dates_url) #run this function to test available data range ,which is 2020-12 until 2023-11
+
+
+# use API to scrap all the police forces
+forces_url <- "https://data.police.uk/api/forces"
+
+forces<- fromJSON(forces_url)
+# print(forces$id)
+
+stop_and_searches_by_force_url <-"https://data.police.uk/api/stops-force?force=avon-and-somerset&date=2021-11"
+# fromJSON(stop_and_searches_by_force_url)
+
+
+```
+
+
+```{r,eval=FALSE}
+# write a function to use api to scrapping data
+get_force_data_monthly <- function(year, month, force) {
+  formatted_month <- formatC(month, width = 2, format = "d", flag = "0")
+  url <- paste0("https://data.police.uk/api/stops-force?force=", force, "&date=", year, "-", formatted_month)
+  response <- GET(url)
+  if (status_code(response) == 200) {
+    data <- fromJSON(rawToChar(response$content), flatten = TRUE)
+    # check whether it return data
+    if (is.data.frame(data) && nrow(data) > 0) {
+      # add police force id and year to the result dataframe
+      data$force <- force
+      data$year <- year
+      return(data)
+    }
+  }
+  # return empty data frame if no data or request failed
+  return(data.frame(year = integer(0), force = character(0), stringsAsFactors = FALSE))
+}
+
+# build an empty list to store data
+all_data <- list()
+```
+
+```{r,eval=FALSE}
+# use loop to go through all month from 2021 to 2023( As we decide to use 2021 census data to eliminate scale influence) 
+years <- 2021:2023
+for (force in forces$id) {
+  for (year in years) {
+    for (month in 1:12) {
+      message("Fetching data for ", force, " in ", year, "-", month)
+      monthly_data <- get_force_data_monthly(year, month, force)
+      all_data[[length(all_data) + 1]] <- monthly_data
+    }
+  }
+}
+
+# combine all data frame into one and fill NA for empty cell
+all_data_df <- bind_rows(all_data).  # this is original data
+
+#print(head(all_data_df))
+# store data at local
+write.csv(all_data_df, "all_data_df.csv", row.names = FALSE)
+```
+
+```{r}
+#import research data
+stop_and_searches_2021_2023<- read.csv("all_data_df.csv")
+#head(stop_and_searches_2021_2023)
+# Rearrange columns
+stop_and_searches_2021_2023<- stop_and_searches_2021_2023 %>%
+  select(year, force, age_range, gender, self_defined_ethnicity, officer_defined_ethnicity, 
+         outcome_linked_to_object_of_search, datetime, everything())
+# head(stop_and_searches_2021_2023)
+```
+
+
+```{r}
+
+#edit data format to makeit coherenent among all data used
+stop_and_searches_2021_2023<- stop_and_searches_2021_2023 %>%
+  mutate(
+    combined_ethnicity = ifelse(
+      !is.na(officer_defined_ethnicity),
+      officer_defined_ethnicity,
+      case_when(
+        str_detect(self_defined_ethnicity, "Black|African|Caribbean") ~ "Black",
+        str_detect(self_defined_ethnicity, "Asian|Asian") ~ "Asian or Asian British",
+        str_detect(self_defined_ethnicity, "Mixed|Multiple") ~ "Mixed",
+        # Add more patterns as necessary
+        TRUE ~ word(self_defined_ethnicity, 1)  # Fallback to the first word
+      )
+    ),
+    combined_ethnicity = case_when(
+      combined_ethnicity == "Asian" ~ "Asian or Asian British",
+      combined_ethnicity == "Black" ~ "Black or Black British",
+      combined_ethnicity == "Other" ~ "Other Ethnic Group",
+      TRUE ~ combined_ethnicity
+    )
+  ) %>%
+  relocate(
+    combined_ethnicity,
+    .after = officer_defined_ethnicity
+  )
+
+```
+
+```{r}
+
+#install.packages(c("DBI", "RSQLite"))
+library(DBI)
+
+# Create database: This will create a file in our hard drive if it does not exist already. 
+db <- dbConnect(RSQLite::SQLite(), "database/assignment4.sqlite")
+db_exists <- file.exists("database/assignment4.sqlite")
+# db_exists
+
+
+# write the called API data into databse after manipulation 
+dbWriteTable(db, "stop_and_searches_2021_2023", stop_and_searches_2021_2023, row.names = FALSE, overwrite = TRUE)
+
+```
+
+
+```{r,eval=FALSE}
+stop_search_mar21_mar23 <- read.csv("stop-search-open-data-tables-mar21-mar23.csv")
+
+dbWriteTable(db, "stop_search_mar21_mar23", stop_search_mar21_mar23, row.names = FALSE, overwrite = TRUE)
+tables <- dbListTables(db)
+print(tables)
+dbListFields(db,"stop_search_mar21_mar23")
+
+```
+
+
+```{r}
+#check how many forces stop and research data are included
+unique_values_in_force <- unique(stop_and_searches_2021_2023$force)
+#unique_values_in_force
+```
+
+
+#### 2) Census Data Integration:
+
+##### • Dowanload Population of England and Wales from the 2011 and 2021 Censuses, broken down by Police Force Area and self-defined ethnicity group
+
+As it only includes self-defined ethnicity, hence only used for force analysis.
+
+```{r}
+library(dplyr)
+
+# import 2021 census data, population by force and ethnicity 
+population_by_force_by_ethnicity_21census<- read.csv("population-by-force-by-ethnicity.csv")
+population_by_force_by_ethnicity_21census <- population_by_force_by_ethnicity_21census %>%
+  mutate(
+    combinedethnicity = case_when(
+       grepl("Mixed", Self.defined.ethnicity) ~ "Mixed",  # Assign "Mixed" when Self.defined.ethnicity is "Mixed"
+
+      TRUE ~ Self.defined.ethnicity
+    ),
+    Police.Force.Area = case_when(
+      Police.Force.Area == "Avon and Somerset" ~ "avon-and-somerset",
+      Police.Force.Area == "Devon and Cornwall" ~ "devon-and-cornwall",
+      Police.Force.Area == "London, City of" ~ "city-of-london",
+      Police.Force.Area == "Dyfed-Powys" ~ "dyfed-powys",
+      Police.Force.Area == "North Wales" ~ "north-wales",
+      Police.Force.Area == "South Wales" ~ "south-wales",
+      Police.Force.Area == "Thames Valley" ~ "thames-valley",
+      Police.Force.Area == "South Yorkshire" ~ "south-yorkshire",
+      Police.Force.Area == "North Yorkshire" ~ "north-yorkshire",
+      Police.Force.Area == "West Mercia" ~ "west-mercia",
+      Police.Force.Area == "West Midlands" ~ "west-midlands",
+      Police.Force.Area == "West Yorkshire" ~ "west-yorkshire",
+       Police.Force.Area == "Greater Manchester" ~ "greater-manchester",
+       Police.Force.Area == "Metropolitan Police" ~ "Metropolitan",
+      
+      TRUE ~ Police.Force.Area
+    )
+  )
+
+population_by_force_by_ethnicity_21census <- population_by_force_by_ethnicity_21census %>%
+  filter(Census.Year != 2011)
+
+population_by_force_by_ethnicity_21census$Police.Force.Area <- tolower(population_by_force_by_ethnicity_21census$Police.Force.Area)
+
+population_by_force_by_ethnicity_21census$Population <- as.numeric(gsub(",", "", population_by_force_by_ethnicity_21census$Population))
+#head(population_by_force_by_ethnicity_21census)
+
+
+dbWriteTable(db, "population_by_force_by_ethnicity_21census", population_by_force_by_ethnicity_21census, row.names = FALSE, overwrite = TRUE)
+
+tables <- dbListTables(db)
+
+# print(tables)
+
+
+# dbListFields(db,"population_by_force_by_ethnicity_21census")
+```
+
+##### • CSS selector to scrap 2021 Census Population ethnicity figure by age group
+```{r}
+library(rvest)
+library(xml2)
+
+# URL of the webpage to scrape
+url <- "https://www.ethnicity-facts-figures.service.gov.uk/uk-population-by-ethnicity/demographics/age-groups/latest/"
+
+# Read the HTML content from the website
+webpage <- read_html(url)
+
+# Extract the table
+table <- html_node(webpage, "#main-content > div:nth-child(12) > div > div:nth-child(1) > div > div > div > table")
+
+# Convert the table into a dataframe
+df <- html_table(table, fill = TRUE)
+
+# Setting the second row as header
+colnames(df) <- as.character(unlist(df[2, ]))
+
+# Removing the first two rows
+df <- df[-c(1, 2), ]
+
+# View the modified dataframe
+# head(df)
+df <- rename(df, Age = `Age brackets`)
+
+
+# Gathering all columns except the first one into key-value pairs
+age_ethnicity <- gather(df, key = "key", value = "value", -1)
+
+# Creating separate columns for 'ethnicity' and 'type' (percentage or count)
+age_ethnicity<- age_ethnicity %>%
+  separate(key, into = c("ethnicity", "type"), sep = " ") %>%
+  spread(type, value)
+
+# Renaming columns for clarity
+colnames(age_ethnicity) <- c("age_group", "ethnicity", "Percentage", "Population")
+
+age_ethnicity$Population <- as.numeric(gsub(",", "", age_ethnicity$Population))
+# View the transformed dataframe
+# head(age_ethnicity)
+
+
+# Function to map age groups
+map_age_group <- function(age_group) {
+  if (age_group %in% c("Age 0 to 4", "Age 5 to 9")) {
+    return("under 10")
+  } else if (age_group %in% c("Age 10 to 14", "Age 15 to 17")) {
+    return("10-17")
+  } else if (age_group == "Age 18 to 24") {
+    return("18-24")
+  } else if (age_group %in% c("Age 25 to 29", "Age 30 to 34")) {
+    return("25-34")
+  } else {
+    return("over 34")
+  }
+}
+
+# Apply the function to the dataframe
+age_ethnicity$age_group <- sapply(age_ethnicity$age_group, map_age_group)
+
+
+age_ethnicity<- age_ethnicity %>%
+  mutate(
+    ethnicity = case_when(
+      ethnicity == "Asian" ~ "Asian or Asian British",
+      ethnicity == "Black" ~ "Black or Black British",
+      ethnicity == "Other" ~ "Other Ethnic Group",
+      TRUE ~ ethnicity  # Keeps other values unchanged
+    )
+  )
+
+age_ethnicity <- age_ethnicity %>%
+  filter(ethnicity != "All")
+# View the modified dataframe
+# head(age_ethnicity)
+dbWriteTable(db, "age_ethnicity", age_ethnicity , row.names = FALSE, overwrite = TRUE)
+
+```
+##### • Downloaded 2021 Census population by Age, ethnic group and sex from National Statistics 
+
+Defining “Reasonable Percentage”: Creating a metric to evaluate if searches correlate with legitimate police concerns or potential biases. This metric considers the proportion of outcome-linked searches.
+
+Data discrepancies, such as the gender binary in 2021 Census, were noted for their potential impact on gender-based analysis.
+
+#### 3) Data Limitations :
+
+Unavailability of data from certain police forces
+
+
+```{r,eval=FALSE}
+library(dplyr)
+library(RSelenium)
+library(rvest)
+library("netstat")
+library(stringr)
+ driver <- rsDriver(browser = "firefox",  port = free_port(random = TRUE), chromever = NULL) 
+  remDr <- driver[["client"]]
+  url<-"https://data.police.uk/changelog/"
+  url2<-"https://data.police.uk/data/"
+  remDr$navigate(url)
+  
+  html <- read_html(url)
+greater_manchester<- html%>% html_elements(css=" #content > div:nth-child(2) > ul:nth-child(3) > li:nth-child(5)" )
+greater_manchester_text <- greater_manchester%>% html_text()
+greater_manchester_text<- gsub("^\\s+|\\s+$", "", greater_manchester_text)
+
+gwent<- html%>% html_elements(css=" #content > div:nth-child(2) > ul:nth-child(3) > li:nth-child(6)" )
+gwent_text <-gwent%>% html_text()
+gwent_text<- gsub("^\\s+|\\s+$", "", gwent_text)
+
+ html <- read_html(url2)
+north_ireland<- html%>% html_elements(css=" #downloads > p:nth-child(2)" )
+north_ireland_text <- north_ireland%>% html_text()
+
+writeLines(greater_manchester_text, "greater_manchester_text.txt")
+writeLines(gwent_text, "gwent_text.txt")
+writeLines(north_ireland_text, "north_ireland_text.txt")
+```
+
+
+```{r}
+greater_manchester_text <- readLines("greater_manchester_text.txt")
+gwent_text <- readLines("gwent_text.txt")
+north_ireland_text <- readLines("north_ireland_text.txt")
+
+greater_manchester_text
+gwent_text
+north_ireland_text
+```
+
+```{r}
+ethnicity_age_sex_census<- read.csv("age-sex-ethnicity.csv")
+
+# Selecting specific columns and renaming them
+ethnicity_age_sex_census <- ethnicity_age_sex_census %>%
+  select(
+    age = `Age..86.categories..Code`, 
+    ethnicity_group = `Ethnic.group..6.categories.`,
+    sex = `Sex..2.categories.`,
+    observation = Observation
+  )
+
+# View the modified dataframe
+# shead(ethnicity_age_sex_census)
+
+age_groups <- c("under 10", "10-17", "18-24", "25-34", "over 34")
+ethnicity_age_sex_census <- ethnicity_age_sex_census %>%
+  mutate(age_group = cut(age, 
+                         breaks = c(-Inf, 10, 18, 25, 34, Inf),
+                         labels = age_groups,
+                         right = FALSE))
+
+ethnicity_age_sex_census <- ethnicity_age_sex_census %>%
+  mutate(
+    ethnicity_group = case_when(
+      ethnicity_group == "Asian, Asian British or Asian Welsh" ~ "Asian or Asian British",
+      ethnicity_group == "Black, Black British, Black Welsh, Caribbean or African" ~ "Black or Black British",
+      ethnicity_group == "Mixed or Multiple ethnic groups" ~ "Mixed",
+      ethnicity_group == "Other ethnic group" ~ "Other Ethnic Group",
+      TRUE ~ ethnicity_group  # Keeps other values unchanged
+    )
+  )
+
+ethnicity_age_sex_census <- select(ethnicity_age_sex_census, -age)
+# head(ethnicity_age_sex_census)
+
+
+dbWriteTable(db, "ethnicity_age_sex_census", ethnicity_age_sex_census , row.names = FALSE, overwrite = TRUE)
+```
+
+
+
+```{r}
+#This is a brief summary about the 2021 Census population data against research variable gender, ethnicity, age and local force population, which would be use to eliminate the scale influene introdued by total number of searches.
+
+age_population_df <- dbGetQuery(db,"
+SELECT 
+    age_group,
+    SUM(REPLACE(Population, ',', '') + 0) AS TotalPopulation
+    FROM age_ethnicity
+GROUP BY age_group")
+
+
+ethnicity_population_df <- dbGetQuery(db, "
+  SELECT 
+     combinedethnicity,
+     SUM(REPLACE(Population, ',', '') + 0) AS TotalPopulation
+  FROM population_by_force_by_ethnicity_21census
+  GROUP BY combinedethnicity")
+
+
+force_population_df <- dbGetQuery(db, "
+  SELECT 
+      `Police.Force.Area`,
+     SUM(REPLACE(Population, ',', '') + 0) AS TotalPopulation
+  FROM population_by_force_by_ethnicity_21census
+  GROUP BY `Police.Force.Area`")
+
+
+sex_population_df <- dbGetQuery(db, "
+ SELECT 
+    sex,
+    SUM(REPLACE(observation, ',', '') + 0) AS TotalPopulation
+    FROM ethnicity_age_sex_census
+GROUP BY sex")
+```
+
+
+```{r,eval=FALSE}
+age_population_df
+ethnicity_population_df
+force_population_df
+sex_population_df
+```
+
+
+### 3. Analysis 
+
+
+Analysis involved SQL-driven data manipulation, focusing on search frequency, search rate per 1000 population, outcome-linked searches proportion against demographic variables, presenting by year and in total.
+
+
+Assumption: the research could be reasonable based on the police experience, local crime rate, hence we introduce reasonable search percentage to assess it, if  a realtive low proportion of research outcome not link to the research object but a relative high quantity of research was conducted, a potential bias might exist
+
+#### 3.1 Gender-Based Analysis
+
+
+```{r}
+
+#indentify the potential value in gender column from orginal databse
+unique_values_in_gender <- unique(stop_and_searches_2021_2023$gender)
+# unique_values_in_gender
+```
+
+
+```{r}
+ 
+sex_sum <- dbGetQuery(db, "
+ SELECT 
+   gender,
+   COUNT(*) AS number_of_searches,
+   COUNT(*)/3 AS average_number_of_searches_per_year,
+   
+   (COUNT(*) * 1000.0) /  
+   (3* (SELECT SUM(REPLACE(psex.observation, ',', '') + 0) FROM ethnicity_age_sex_census psex  
+   WHERE psex.sex = ss.gender) )AS searches_per_1000_population_per_year,
+   
+   (COUNT(*) * 100.0) / 
+   (SELECT COUNT(*) FROM stop_and_searches_2021_2023 
+   WHERE gender IS NOT NULL) AS search_percentage,
+
+   (SUM(CASE WHEN outcome_linked_to_object_of_search = TRUE THEN 1 ELSE 0 END) * 100.0) / 
+   NULLIF(COUNT(*), 0) AS reasonable_search_percentage
+   
+FROM stop_and_searches_2021_2023  ss
+WHERE gender IS NOT NULL
+GROUP BY gender
+")
+# sex_sum
+
+```
+
+
+```{r}
+sex_df_year <- dbGetQuery(db, "
+ SELECT
+ year,
+ gender,
+ COUNT(*) AS number_of_searches,
+ 
+ (COUNT(*) * 1000.0) / 
+ ((SELECT SUM(REPLACE(psex.observation, ',', '') + 0) FROM ethnicity_age_sex_census psex  
+ WHERE psex.sex = ss.gender) )AS searches_per_1000_population_per_year,
+
+ (COUNT(*) * 100.0) / 
+ (SELECT COUNT(*)
+ FROM stop_and_searches_2021_2023
+ WHERE year = ss.year AND gender IS NOT NULL) AS search_percentage_per_year,
+
+ 
+ (SUM(CASE WHEN outcome_linked_to_object_of_search = TRUE THEN 1 ELSE 0 END) * 100.0) / NULLIF(COUNT(*), 0) AS reasonable_search_percentage
+ 
+
+FROM stop_and_searches_2021_2023 ss
+WHERE gender IS NOT NULL
+GROUP BY year, gender
+")
+# sex_df_year
+```
+
+
+
+```{r,eval=FALSE}
+library(ggplot2)
+options(repos = c(CRAN = "https://cran.rstudio.com/"))
+install.packages("scales")
+library(scales)
+```
+
+
+```{r}
+# Create the pie chart
+pie_chart <- ggplot(sex_sum, aes(x = "", y = search_percentage, fill = gender)) +
+  geom_bar(stat = "identity", width = 1) +
+  coord_polar("y", start = 0) +
+  theme_void() +
+  scale_fill_brewer(palette = "Set1", name = "Gender", labels = paste(sex_sum$gender, ": ", round(sex_sum$search_percentage, 2), "%")) +
+  theme(legend.position = "bottom",legend.title = element_blank(),
+        plot.caption = element_text(hjust = 0.5)) +
+  labs(subtitle = "Percentage of Stop and Searches by Sex",
+       caption = "Note:\n• Does not include vehicle only searches.\n• Does not include other sexes. \n• Does not include searches record where sex is unkown",
+        theme(
+          #plot.title = element_text(size = 14),
+              legend.margin = margin(1, 1, 1, 1, unit = "pt"))
+      # subtitle = "from Financial Year 2020 to 2022"
+      )
+
+# Add text labels for all categories except "Other"
+pie_chart <- pie_chart +
+  geom_text(data = subset(sex_sum, gender != "Other"),  # Exclude "Other" here
+            aes(label = paste0(round(search_percentage, 2), "%")), 
+            position = position_stack(vjust = 0.5), 
+            color = "black", size = 3)
+
+# Then, overlay the text label for "Other" closer to the pie
+pie_chart <- pie_chart +
+  geom_text(data = subset(sex_sum, gender == "Other"),
+            aes(label = paste0(round(search_percentage, 2), "%"), 
+                x = 1.2, y = 0),  # Adjust position of "Other" label
+            color = "black", size = 3)+
+  theme(plot.caption = element_text(hjust = 0), # Left-align the text within the caption
+    plot.caption.position = "plot",
+    plot.margin = margin(0.5, 0.5, 0.5, 0.5, "cm"))
+  
+
+# Display the pie chart
+# pie_chart
+
+
+# Filter out the "Other" category for displaying 
+filtered_sex_sum <- sex_sum %>% 
+  filter(gender != "Other") %>% 
+  droplevels()  # Important: This drops unused factor levels
+
+
+# Define colors for each ethnicity
+base_colors <- c("Male" = "#1f77b4", 
+                 "Female" = "#d62728")
+
+# Create a named vector for alpha values to be used for the legend
+alpha_values <- c("Linked to search object" = 1, "No Link" = 0.45)
+
+# Create the bar chart
+bar_chart <- ggplot(filtered_sex_sum, aes(x = gender, y = number_of_searches, fill = gender)) +
+ geom_bar(stat = "identity", aes(alpha = "No Link")) +
+  geom_bar(stat = "identity", 
+           aes(y = number_of_searches * reasonable_search_percentage / 100, alpha = "Linked to search object")) +
+  geom_text(aes(y = number_of_searches * reasonable_search_percentage / 100, 
+                label = paste0(round(reasonable_search_percentage, 2), "%")), 
+            vjust = 1.3, size=2.8,
+            color = "black") +
+  geom_text(aes(label = number_of_searches), 
+            position = position_stack(vjust = 1.1), 
+            color = "black") +
+  scale_y_continuous(labels = label_number())+
+  scale_fill_manual(values = base_colors) +
+  scale_alpha_manual(values = alpha_values, 
+                     guide = guide_legend(title = "Outcome")) +
+  theme_minimal() +
+  labs( 
+    #theme(plot.title = element_text(size = 8)),
+    #caption = "Note: \n• Does not include vehicle only searches.\n• Does not include other sexes. \n• Does not include searches record where sex is unkown",
+    subtitle = "Total Number of Stop and Searches by Sex ",
+        #subtitle = "in financial year with outcome-linked searches percentage",
+       x = "Gender", y = "Total Number of Searches", fill = "Gender") +
+  theme(axis.text.x = element_text( size = 8),
+        plot.subtitle = element_text(hjust = 0.9,vjust=2))+
+ theme(legend.text = element_text(size = 8),  # Adjust text size
+        legend.key.size = unit(0.5, "cm"))+
+  guides(fill = guide_legend(nrow = 1, title = "Gender"),
+         alpha = guide_legend(nrow = 1, title = "Outcome")) +
+  theme(legend.position = "bottom",
+        legend.box = "vertical",
+        ) 
+
+#bar_chart
+
+grid.arrange(pie_chart, bar_chart, ncol = 2,  widths = c(0.95, 1),  top = textGrob("Search Against Gender from 2021 to 2023 with Outcome-linked Percentage ", 
+                                                            gp = gpar(fontface = "bold", fontsize = 14)))
+
+```
+
+Pie chart shows gender distribution in police searches.
+
+Bar charts compare search frequency, search per 1000 population and outcome-linked percentages by gender.
+
+```{r}
+library(ggplot2)
+library(scales)  
+
+
+# Filter out the "Other" category
+filtered_sex_df_year <- sex_df_year %>% 
+  filter(gender != "Other") %>% 
+  droplevels()  # Important: This drops unused factor levels
+
+# Convert 'year' to a factor to ensure proper dodging
+filtered_sex_df_year$year <- factor(filtered_sex_df_year$year)
+
+# Plotting the bar chart
+ggplot(filtered_sex_df_year, aes(x = gender, y = searches_per_1000_population_per_year, fill = year)) +
+  geom_bar(stat = "identity", position = position_dodge()) +
+  geom_text(
+    aes(label = paste0(round(searches_per_1000_population_per_year, 2)), group = year),
+    vjust = -0.3,
+    position = position_dodge(width = 0.9),
+    color = "black",
+    size = 3
+  ) +
+  scale_y_continuous(labels = scales::comma) +
+  labs(
+    caption = "Note: \n• Does not include vehicle only searches.\n• Does not include other sexes. \n• Does not include searches record where sex is unkown",
+    y = "Number of Searches per 1000 Population",x="Gender",
+    title = "Search Rate: Number of Searches per 1000 Population by Ethnicity",
+    subtitle = "from Financial Year 2020 to 2022 using 2021 Census Data"
+  ) +
+  theme_minimal() +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    plot.title = element_text(hjust = 0.5),# Center-align the title
+    plot.subtitle = element_text(hjust = 0.5),# Center-align the subtitle
+    plot.caption = element_text(hjust = 0), # Left-align the text within the caption
+    plot.caption.position = "plot",
+    plot.margin = margin(0.5, 0.5, 0.5, 0.5, "cm")
+  )
+    
+
+```
+
+```{r}
+library(ggplot2)
+library(scales)  # For formatting the y-axis labels
+
+
+# Calculate the non-reasonable searches
+filtered_sex_df_year$non_reasonable_searches <- filtered_sex_df_year$number_of_searches - (filtered_sex_df_year$number_of_searches * filtered_sex_df_year$reasonable_search_percentage / 100)
+
+# Define alpha values for reasonable and non-reasonable searches
+alpha_values <- c("Link to search object" = 1, "No link" = 0.5)  # Adjust non-reasonable alpha here
+
+# Plotting the bar chart
+ggplot(filtered_sex_df_year, aes(x = gender, fill = year)) +
+  # Reasonable searches
+  geom_bar(aes(y = number_of_searches * reasonable_search_percentage / 100, alpha = "Link to search object"), stat = "identity", position = "dodge") +
+  # Non-reasonable searches (adjusted alpha value for better visibility)
+  geom_bar(aes(y = non_reasonable_searches, alpha = "No link"), stat = "identity", position = "dodge") +
+  # Labels for total number of searches
+  geom_text(
+    aes(y = number_of_searches, label = number_of_searches), 
+    vjust = -0.3, 
+    position = position_dodge(width = 0.9), 
+    color = "black", 
+    size = 3
+  ) +
+  # Labels for percentage of reasonable searches
+  geom_text(
+    aes(y = number_of_searches * reasonable_search_percentage / 100, label = paste0(round(reasonable_search_percentage, 2), "%")), 
+    vjust = -0.5, 
+    position = position_dodge(width = 0.9), 
+    color = "black", 
+    size = 2.5
+  ) +
+  scale_y_continuous(labels = scales::comma) +
+  scale_alpha_manual(values = alpha_values, guide = guide_legend(title = "Search Outcome")) +
+  labs(caption = "Note: \n• Does not include vehicle only searches.\n• Does not include other sexes. \n• Does not include searches record where sex is unkown",x = "Gender Group", y = "Number of Searches", title = "Number of Stop and Searches by Gender from Financial Year 2020 to 2022") +
+  theme_minimal() +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    plot.caption = element_text(hjust = 0),
+    plot.caption.position = "plot",
+      plot.margin = margin(0.5, 0.5, 0.5, 0.5, "cm"))
+
+
+
+```
+
+
+Line graphs compare the trend of search frequency by gender, search per 1000 population from 2021 to 2023.
+
+```{r}
+library(ggplot2)
+library(scales)
+library(tidyr)
+library(dplyr)
+
+sex_df_year$year <- as.numeric(as.character(sex_df_year$year))
+# Reshape the data to long format
+long_sex_df_year <- sex_df_year %>%
+  pivot_longer(
+    cols = c(searches_per_1000_population_per_year, number_of_searches),
+    names_to = "metric",
+    values_to = "value"
+  )
+long_sex_df_year <- long_sex_df_year %>%
+  filter(!is.na(year) & !is.na(value) & !is.na(gender))
+
+# Plotting the line graph
+line_chart <- ggplot(long_sex_df_year, aes(x = year, y = value, color = gender, group = gender)) +
+  geom_line() +
+  geom_point() + # Add points to the line
+  geom_text(
+    aes(label = paste0(round(value, 2))),
+    vjust = -0.5,  # Adjust this value to position the text above the points
+    color = "black", 
+    size = 2.1,
+    check_overlap = TRUE  # Avoid overlapping text
+  ) +
+  scale_x_continuous(breaks = unique(sex_df_year$year)) + # Set breaks at unique years
+  scale_y_continuous(labels = scales::comma) +
+  facet_wrap(~ metric, scales = "free_y") +
+  labs(
+    caption = "Note: \n• Does not include vehicle only searches. \n• Does not include searches record whose ethnicity is unknown.",
+    x = "Year", y = "Value", 
+    title = "Search Rate and Total Number of Searches per 1000 Population by Gender",
+    subtitle = "from Financial Year 2020 to 2022 using 2021 Census Data"
+  ) +
+  theme_minimal() +
+  theme(
+    legend.position = "bottom",
+    plot.subtitle = element_text(hjust = 0.5),# Center-align the subtitle
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    plot.title = element_text(hjust = 0),   
+    plot.caption = element_text(hjust = 0),
+    plot.caption.position = "plot",
+    plot.margin = margin(0.5, 0.5, 0.5, 0.5, "cm")
+  )
+
+# Display the line graph
+print(line_chart)
+
+```
+
+
+A significant gender disparity exist in searches, with males constituting 89% of cases. Notably, while males have a higher search frequency, females show a higher rate of outcome-linked searches. This discrepancy raises questions about gender biases in search practices.
+
+
+#### 3.2 Ethnicity-Based Analysis
+```{r}
+unique_values_in_ethnicity <- unique(stop_and_searches_2021_2023$combined_ethnicity)
+# unique_values_in_ethnicity
+
+```
+
+
+```{r}
+ethnicity_df_year <- dbGetQuery(db, "
+ SELECT 
+    year,
+    combined_ethnicity as ethnicity,
+    
+    COUNT(*) AS number_of_searches,
+    
+    (COUNT(*) * 1000.0) / 
+     ((SELECT SUM(REPLACE(p.Population, ',', '') + 0)
+     FROM population_by_force_by_ethnicity_21census p 
+       WHERE p.combinedethnicity = ss.combined_ethnicity) )AS searches_per_1000_population_per_year,
+       
+    (COUNT(*) * 100.0) / (SELECT COUNT(*) 
+    FROM stop_and_searches_2021_2023 
+    WHERE year = ss.year AND combined_ethnicity IS NOT NULL) AS search_percentage,
+    
+    SUM(CASE WHEN outcome_linked_to_object_of_search = TRUE THEN 1 ELSE 0 END) *100/ NULLIF(COUNT(*), 0)  AS percentage_reasonable
+    
+FROM stop_and_searches_2021_2023 ss
+WHERE combined_ethnicity IS NOT NULL
+GROUP BY year,combined_ethnicity
+")
+# ethnicity_df_year
+```
+
+
+```{r}
+ethnicity_df <- dbGetQuery(db, "
+ SELECT 
+    combined_ethnicity as ethnicity,
+    COUNT(*) AS number_of_searches,
+    COUNT(*)/3 AS average_number_of_searches_per_year,
+    
+    (COUNT(*) * 1000.0) / 
+    (3*(SELECT SUM(REPLACE(p.Population, ',', '') + 0)FROM population_by_force_by_ethnicity_21census p 
+       WHERE p.combinedethnicity = ss.combined_ethnicity) )AS searches_per_1000_population_per_year,
+      
+    (COUNT(*) * 100.0) / (SELECT COUNT(*) 
+    FROM stop_and_searches_2021_2023 
+    WHERE combined_ethnicity IS NOT NULL) AS search_percentage,
+    
+    SUM(CASE WHEN outcome_linked_to_object_of_search = TRUE THEN 1 ELSE 0 END) *100/ 
+    NULLIF(COUNT(*), 0)  AS percentage_reasonable
+      
+    
+FROM stop_and_searches_2021_2023 ss
+WHERE combined_ethnicity IS NOT NULL
+GROUP BY combined_ethnicity
+")
+# ethnicity_df
+
+
+```
+
+
+Pie chart shows ethnicity distribution in police searches.White has a dominant position in total quantity (62.65%) followed by Black (19.54%) and Asian (12.44%).
+
+```{r}
+library(ggplot2)
+library(scales)
+# Assuming ethnicity_df is your dataframe already loaded in R
+
+# Pie Chart for search_percentage with labels
+pie_chart <- ggplot(ethnicity_df, aes(x = "", y = search_percentage, fill = ethnicity)) +
+  geom_bar(stat = "identity", width = 1) +
+  coord_polar("y", start = 0) +
+  geom_text(aes(label = paste0(round(search_percentage, 1), "%")), 
+            position = position_stack(vjust = 0.5), 
+            color = "black",size=2.4) +
+  theme_void() +
+ scale_fill_brewer(palette = "Set1", name = "Ethnicity", labels = paste(ethnicity_df$ethnicity, ": ", round(ethnicity_df$search_percentage, 2),
+"%"))+
+  labs(caption = "Note: \n• Does not include vehicle only searches. \n• Does not include searches record whose ethnicity is unkown.",
+       fill = "Ethnicity", 
+       title = "Percentage of Searches by Ethnicity from Year 2021 to 2023")+
+  theme(
+    plot.caption = element_text(hjust = 0),  # Left-align the text within the caption
+    plot.caption.position = "plot"  # Center the caption box itself at the bottom of the plot
+  ) +
+  theme(plot.margin = margin(1, 1, 1, 1, "cm"))# Center-align the subtitle
+
+pie_chart
+```
+
+Bar charts reveals search frequency, search per 1000 population and outcome-linked percentages by ethnicity.
+
+```{r}
+# Define colors for each ethnicity
+base_colors <- c("Asian or Asian British" = "#d62728", 
+                 "Black or Black British" = "#1f77b4", 
+                 "Other Ethnic Group" = "purple", 
+                 "White" = "#ff7f0e",
+                 "Mixed" = "#2ca02c")
+
+# Create a named vector for alpha values to be used for the legend
+alpha_values <- c("Linked to search object" = 1, "No Link" = 0.45)
+
+# Create the bar chart
+bar_chart <- ggplot(ethnicity_df, aes(x = ethnicity, y = number_of_searches, fill = ethnicity)) +
+  geom_bar(stat = "identity", aes(alpha = "No Link")) +
+  geom_bar(stat = "identity", 
+           aes(y = number_of_searches * percentage_reasonable / 100, alpha = "Linked to search object")) +
+  # Labels for percentage of reasonable searches
+  geom_text(aes(y = number_of_searches * percentage_reasonable / 100, 
+                label = paste0(round(percentage_reasonable, 2), "%")), 
+            vjust = 0.8, 
+            color = "black",size=2) +
+  # Labels for total number of searches)
+  geom_text(aes(label = number_of_searches), 
+            vjust = -0.05, 
+            color = "black",size=3) +
+  scale_y_continuous(labels = comma) +
+  scale_fill_manual(values = base_colors) +
+  scale_alpha_manual(values = alpha_values, 
+                     guide = guide_legend(title = "Search Outcome")) +
+  theme_minimal() +
+  labs(caption = "Note: \n• Does not include vehicle only searches. \n• Does not include searches record whose ethnicity is unkown.",
+       title = "Total Number of Stop and Searches by Ethnicity from 2021 to 2023",
+        subtitle = "with outcome-linked searches percentage",
+       x = "Ethnicity", y = "Number of Searches", fill = "Ethnicity") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1, size = 8),
+        plot.subtitle = element_text(hjust = 0.5))+ # Center-align the subtitle
+  theme(plot.subtitle = element_text(hjust = 0.5),# Center-align the subtitle
+    plot.caption = element_text(hjust = 0),  # Left-align the text within the caption
+    plot.caption.position = "plot"  # Center the caption box itself at the bottom of the plot
+  ) +
+  
+  theme(plot.margin = margin(0.5,0.5,  0.5,  0.5, "cm"))# Center-align the subtitle
+
+bar_chart
+
+```
+
+```{r}
+library(ggplot2)
+library(scales)  # For formatting the y-axis labels
+
+
+
+# Convert 'year' to a factor to ensure proper dodging
+ethnicity_df_year$year <- factor(ethnicity_df_year$year)
+
+# Plotting the bar chart
+ggplot(ethnicity_df_year, aes(x = ethnicity, y = searches_per_1000_population_per_year, fill = year)) +
+  geom_bar(stat = "identity", position = "dodge") +
+  geom_text(
+    aes(label = paste0(round(searches_per_1000_population_per_year, 2)), group = year),
+    #aes(label = as.integer(searches_per_1000_population_per_year)),  # Format as integer
+    vjust = -0.3, 
+    position = position_dodge(width = 0.9), 
+    color = "black", 
+    size = 3  # Adjust the text size here
+  ) +
+  scale_y_continuous(labels = scales::comma) +  # Use comma formatting for y-axis
+  labs(caption = "Note: \n• Does not include vehicle only searches. \n• Does not include searches record whose ethnicity is unkown.",x = "Ethnic Group", y = "Number of Searches per 1000 Population", title = "Search Rate: Number of Searches per 1000 Population by Ethnicity",
+       subtitle = "from Financial Year 2021 to 2023 using 2021 Census Data") +
+  theme_minimal() +
+  theme(plot.caption = element_text(hjust = 0.5),
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    plot.title = element_text(hjust = 0.5),   # Center-align the title
+  )+
+  theme(
+    plot.caption = element_text(hjust = 0),  # Left-align the text within the caption
+    plot.caption.position = "plot"  # Center the caption box itself at the bottom of the plot
+  ) +
+  theme(plot.margin = margin(0.5, 0.5, 0.5, 0.5, "cm"))# Center-align the subtitle
+
+```
+
+
+```{r}
+library(ggplot2)
+library(scales)  # For formatting the y-axis labels
+
+# Convert 'year' to a factor to ensure proper dodging
+ethnicity_df_year$year <- factor(ethnicity_df_year$year)
+
+# Calculate the non-reasonable searches
+ethnicity_df_year$non_reasonable_searches <- ethnicity_df_year$number_of_searches - (ethnicity_df_year$number_of_searches * ethnicity_df_year$percentage_reasonable / 100)
+
+# Define alpha values for reasonable and non-reasonable searches
+alpha_values <- c("Linked to search object" = 1, "No link" = 0.5)  # Adjust non-reasonable alpha here
+
+# Plotting the bar chart
+ggplot(ethnicity_df_year, aes(x = ethnicity, fill = year)) +
+  # Reasonable searches
+  geom_bar(aes(y = number_of_searches * percentage_reasonable / 100, alpha = "Linked to search object"), stat = "identity", position = "dodge") +
+  # Non-reasonable searches (adjusted alpha value for better visibility)
+  geom_bar(aes(y = non_reasonable_searches, alpha = "No link"), stat = "identity", position = "dodge") +
+  # Labels for total number of searches
+  geom_text(
+    aes(y = number_of_searches, label = number_of_searches), 
+    vjust = -0.4, 
+    position = position_dodge(width = 0.9), 
+    color = "black", 
+    size = 2
+  ) +
+  # Labels for percentage of reasonable searches
+  geom_text(
+    aes(y = number_of_searches * percentage_reasonable / 100, label = paste0(round(percentage_reasonable, 2), "%")), 
+    vjust = 0.7, 
+    position = position_dodge(width = 0.9), 
+    color = "black", 
+    size = 2.5
+  ) +
+  scale_y_continuous(labels = scales::comma) +
+  scale_alpha_manual(values = alpha_values, guide = guide_legend(title = "Search Outcome")) +
+  labs(caption = "Note: \n• Does not include vehicle only searches.\n• Does not include other sexes. \n• Does not include searches record where sex is unkown",x = "Ethnic Group", y = "Number of Searches", title = "Total Number of Stop and Searches by Ethnicity ", subtitle="from Year 2021 to 2023 with outcome-linked search percentage") +
+  theme_minimal() +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1)
+  )+
+  theme(plot.subtitle = element_text(hjust = 0.5),# Center-align the subtitle
+    plot.caption = element_text(hjust = 0),  # Left-align the text within the caption
+    plot.caption.position = "plot"  # Center the caption box itself at the bottom of the plot
+  ) +
+  theme(plot.margin = margin(0.5, 0.5, 0.5, 0.5, "cm"))# Center-align the subtitle
+
+
+
+```
+
+Line graphs indicates the trend of search frequency by ethnicity, search per 1000 population from 2021 to 2023.
+
+```{r}
+ library(ggplot2)
+library(scales)
+library(tidyr)
+library(dplyr)
+
+ethnicity_df_year$year <- as.numeric(as.character(ethnicity_df_year$year))
+# Reshape the data to long format
+long_ethnicity_df_year <- ethnicity_df_year %>%
+  pivot_longer(
+    cols = c(searches_per_1000_population_per_year, number_of_searches),
+    names_to = "metric",
+    values_to = "value"
+  )
+
+# Plotting the line graph
+line_chart <- ggplot(long_ethnicity_df_year, aes(x = year, y = value, color = ethnicity, group = ethnicity)) +
+  geom_line() +
+  geom_point() + # Add points to the line
+  geom_text(
+    aes(label = paste0(round(value, 2))),
+    vjust = -0.5,  # Adjust this value to position the text above the points
+    color = "black", 
+    size = 2.1,
+    check_overlap = TRUE  # Avoid overlapping text
+  ) +
+  scale_x_continuous(breaks = unique(long_ethnicity_df_year$year)) + # Set breaks at unique years
+  scale_y_continuous(labels = scales::comma) +
+  facet_wrap(~ metric, scales = "free_y") +
+  labs(
+    caption = "Note: \n• Does not include vehicle only searches. \n• Does not include searches record whose ethnicity is unknown.",
+    x = "Year", y = "Value", 
+    title = "Search Rate and Total Number of Searches per 1000 Population by Ethnicity",
+    subtitle = "from Year 2021 to 2023 using 2021 Census Data"
+  ) +
+  theme_minimal() +
+  theme(plot.subtitle = element_text(hjust = 0.5),# Center-align the subtitle
+    legend.position = "bottom",
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    plot.title = element_text(hjust = 0.5),   
+    plot.caption = element_text(hjust = 0),
+    plot.margin = margin(0.5, 0.5, 0.5, 0.5, "cm")
+  )
+
+# Display the line graph
+print(line_chart)
+
+```
+
+The data reveals a pronounced ethnic bias, particularly against Black individuals, who face search rates over seven times higher than White individuals. The outcome-linked rate for Black individuals is significantly lower, suggesting searches are less frequently justified. Trends show some reduction in this bias, but the disparity remains stark.
+
+
+#### 3.3 Age-Based Analysis 
+```{r}
+
+unique_values_in_age <- unique(stop_and_searches_2021_2023$age_range)
+#unique_values_in_age
+
+```
+
+
+
+```{r}
+age_sum <- dbGetQuery(db, "
+ SELECT 
+    age_range,
+    COUNT(*) AS number_of_searches,
+    
+    COUNT(*)/3 AS average_number_of_searches,
+    
+    (COUNT(*) * 1000.0) / 
+     (3* (SELECT SUM(REPLACE(page.Population, ',', '') + 0)FROM age_ethnicity page
+       WHERE page.age_group = ss.age_range) )AS searches_per_1000_population,
+       
+    (COUNT(*) * 100.0) / (SELECT COUNT(*) 
+    FROM stop_and_searches_2021_2023 
+    WHERE age_range IS NOT NULL ) AS search_percentage,
+    
+    (SUM(CASE WHEN outcome_linked_to_object_of_search = TRUE THEN 1 ELSE 0 END)*100) / 
+    NULLIF(COUNT(*), 0)  AS percentage_reasonable
+    
+FROM stop_and_searches_2021_2023 ss
+WHERE age_range IS NOT NULL
+GROUP BY age_range
+")
+
+age_df_year <- dbGetQuery(db, "
+ SELECT 
+   year,
+    age_range,
+    COUNT(*) AS number_of_searches,
+    
+    (COUNT(*) * 1000.0) / 
+     ((SELECT SUM(REPLACE(page.Population, ',', '') + 0)
+    FROM age_ethnicity page
+       WHERE page.age_group = ss.age_range) ) AS searches_per_1000_population_per_year,
+       
+    (COUNT(*) * 100.0) / (SELECT COUNT(*) 
+    FROM stop_and_searches_2021_2023 
+    WHERE year = ss.year AND age_range IS NOT NULL ) AS search_percentage,
+    
+    (SUM(CASE WHEN outcome_linked_to_object_of_search = TRUE THEN 1 ELSE 0 END)*100) / NULLIF(COUNT(*), 0) 
+    AS percentage_reasonable
+   
+FROM stop_and_searches_2021_2023 ss
+WHERE age_range IS NOT NULL
+GROUP BY year,age_range
+")
+```
+
+
+```{r,eval=FALSE}
+age_sum
+
+age_df_year
+```
+
+Pie chart shows age distribution in police searches.
+
+
+```{r}
+library(ggplot2)
+library(scales)
+# Assuming ethnicity_df is your dataframe already loaded in R
+
+# Pie Chart for search_percentage with labels
+pie_chart <- ggplot(age_sum, aes(x = "", y = search_percentage, fill = age_range)) +
+  geom_bar(stat = "identity", width = 1) +
+  coord_polar("y", start = 0) +
+  geom_text(aes(label = paste0(round(search_percentage, 2), "%")), 
+            position = position_stack(vjust = 0.5), 
+            color = "black") +
+  theme_void() +
+  scale_fill_brewer(palette = "Set1", name = "Age Group", labels = paste(age_sum$age_range, ": ", round(age_sum$search_percentage, 2),
+"%"))+
+ theme(
+    plot.caption = element_text(hjust = 0),
+    plot.caption.position = "plot",
+    plot.margin = margin(1, 1, 1, 1, "cm")  # Corrected quotation marks
+  )+
+  labs(caption = "Note: \n• Does not include vehicle only searches.\n• Does not include searches record where age is unkown. ",x = "Age Group", y = "Number of Searches", title = "Percentage of Stop and Searches by Age Group from 2021 to 2023")
+
+pie_chart
+```
+
+Bar charts compare search frequency, search per 1000 population and outcome-linked percentages by age.
+
+```{r}
+# Define colors for each ethnicity
+base_colors <- c("under 10"="#ff7f0e",
+                 "10-17" = "#d62728", 
+                 "18-24" ="#1f77b4", 
+                 "25-34" = "#2ca02c", 
+                 "over 34" = "purple"
+                 )
+
+# Create a named vector for alpha values to be used for the legend
+alpha_values <- c("Link to search object" = 1, "No link" = 0.45)
+
+
+
+# Create the bar chart
+bar_chart <- ggplot(age_sum, aes(x = age_range, y = number_of_searches, fill = age_range)) +
+  geom_bar(stat = "identity", aes(alpha = "No link")) +
+  geom_bar(stat = "identity", 
+           aes(y = number_of_searches * percentage_reasonable / 100, alpha = "Link to search object")) +
+  geom_text(aes(y = number_of_searches * percentage_reasonable / 100, 
+                label = paste0(round(percentage_reasonable, 2), "%")), 
+            vjust = 1, 
+            color = "black") +
+  geom_text(aes(label = number_of_searches), 
+            vjust = -0.45, size=2.8,
+            color = "black") +
+  scale_y_continuous(labels = comma) +
+  scale_fill_manual(values = base_colors) +
+  scale_alpha_manual(values = alpha_values, 
+                     guide = guide_legend(title = "Outcome")) +
+  theme_minimal() +
+  labs(caption = "Note: \n• Does not include vehicle only searches.\n• Does not include searches record where age is unkown.", title = "Total Number of Stop and Searches by Age Group from 2021 to 2023",
+        subtitle = "with outcome-linked searches percentage",
+       x = "Age", y = "Number of Searches", fill = "Age") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1, size = 8),
+        plot.subtitle = element_text(hjust = 0.5),
+        plot.caption = element_text(hjust = 0)) # Center-align the subtitle
+
+bar_chart
+
+```
+
+
+```{r}
+library(ggplot2)
+library(scales)  # For formatting the y-axis labels
+
+
+# Convert 'year' to a factor to ensure proper dodging
+age_df_year$year <- factor(age_df_year$year)
+
+# Plotting the bar chart
+ggplot(age_df_year, aes(x = age_range, y = searches_per_1000_population_per_year, fill = year)) +
+  geom_bar(stat = "identity", position = "dodge") +
+  geom_text(
+    aes(label = as.integer(searches_per_1000_population_per_year)),  # Format as integer
+    vjust = -0.3, 
+    position = position_dodge(width = 0.9), 
+    color = "black", 
+    size = 3  # Adjust the text size here
+  ) +
+  scale_y_continuous(labels = scales::comma) +  # Use comma formatting for y-axis
+  labs(x = "Age Group", y = "Number of Searches per 1000 Population", title = "Number of Searches per 1000 Population by Age Group",
+       subtitle = "from  Year 2021 to 2023 using 2021 Census Data") +
+  theme_minimal() +
+  theme(plot.caption = element_text(hjust = 0),
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    plot.title = element_text(hjust = 0.5),   # Center-align the title
+    plot.subtitle = element_text(hjust = 0.5) # Center-align the subtitle
+  )+labs(
+    caption =  "Note: \n• Does not include vehicle only searches.\n• Does not include searches record where age is unkown."
+  )
+
+```
+
+
+```{r}
+library(ggplot2)
+library(scales)  # For formatting the y-axis labels
+
+
+# Convert 'year' to a factor to ensure proper dodging
+age_df_year$year <- factor(age_df_year$year)
+# Calculate the non-reasonable searches
+age_df_year$non_reasonable_searches <- age_df_year$number_of_searches - (age_df_year$number_of_searches * age_df_year$percentage_reasonable / 100)
+
+# Define alpha values for reasonable and non-reasonable searches
+alpha_values <- c("Reasonable" = 1, "Non-Reasonable" = 0.5)  # Adjust non-reasonable alpha here
+
+# Plotting the bar chart
+ggplot(age_df_year, aes(x = age_range, fill =year)) +
+  # Reasonable searches
+  geom_bar(aes(y = number_of_searches * percentage_reasonable / 100, alpha = "Reasonable"), stat = "identity", position = "dodge") +
+  # Non-reasonable searches (adjusted alpha value for better visibility)
+  geom_bar(aes(y = non_reasonable_searches, alpha = "Non-Reasonable"), stat = "identity", position = "dodge") +
+  # Labels for total number of searches
+  geom_text(
+    aes(y = number_of_searches, label = number_of_searches), 
+    vjust = -0.9, 
+    position = position_dodge(width = 0.9), 
+    color = "black", 
+    size = 2.1
+  ) +
+  # Labels for percentage of reasonable searches
+  geom_text(
+    aes(y = number_of_searches * percentage_reasonable / 100, label = paste0(round(percentage_reasonable, 2), "%")), 
+    vjust = 0.5, 
+    position = position_dodge(width = 0.9), 
+    color = "black", 
+    size = 2.5
+  ) +
+  scale_y_continuous(labels = scales::comma) +
+  scale_alpha_manual(values = alpha_values, guide = guide_legend(title = "Search Outcome")) +
+  labs(caption = "Note: \n• Does not include vehicle only searches.\n• Does not include searches record where age is unkown.", x = "Age Group", y = "Number of Searches", title = "Number of Stop and Searches by Age Group from Year 2021 to 2023") +
+  theme_minimal() +
+  theme(
+    plot.caption = element_text(hjust = 0),
+    axis.text.x = element_text(angle = 45, hjust = 1)
+  )
+
+
+```
+
+Line graphs compare the trend of search frequency by age, search per 1000 population from 2021 to 2023.
+
+```{r}
+ library(ggplot2)
+library(scales)
+library(tidyr)
+library(dplyr)
+
+age_df_year$year <- as.numeric(as.character(age_df_year$year))
+# Reshape the data to long format
+long_age_df_year <- age_df_year %>%
+  pivot_longer(
+    cols = c(searches_per_1000_population_per_year, number_of_searches),
+    names_to = "metric",
+    values_to = "value"
+  )
+
+# Plotting the line graph
+line_chart <- ggplot(long_age_df_year, aes(x = year, y = value, color = age_range, group = age_range)) +
+  geom_line() +
+  geom_point() + # Add points to the line
+  geom_text(
+    aes(label = paste0(round(value, 2))),
+    vjust = -0.5,  # Adjust this value to position the text above the points
+    color = "black", 
+    size = 2.1,
+    check_overlap = TRUE  # Avoid overlapping text
+  ) +
+  scale_x_continuous(breaks = unique(long_age_df_year$year)) + # Set breaks at unique years
+  scale_y_continuous(labels = scales::comma) +
+  facet_wrap(~ metric, scales = "free_y") +
+  labs(
+    caption = "Note: \n• Does not include vehicle only searches.\n• Does not include searches record where age is unkown.",
+    x = "Year", y = "Value", 
+    title = "Search Rate and Total Number of Searches per 1000 Population by Age Group",
+    subtitle = "from Financial Year 2020 to 2022 using 2021 Census Data"
+  ) +
+  theme_minimal() +
+  theme(plot.subtitle = element_text(hjust = 0.5),# Center-align the subtitle
+    legend.position = "bottom",
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    plot.title = element_text(hjust = 0.5),   
+    plot.caption = element_text(hjust = 0),
+    plot.margin = margin(0.5, 0.5, 0.5, 0.5, "cm")
+  )
+
+# Display the line graph
+print(line_chart)
+
+```
+
+The 18-24 age group is most frequently searched, with this group accounting for 31.73% of all searches, reducing from 2031 to 2023. The consistency in outcome-linked search proportions across age groups suggests a less pronounced age bias compared to gender or ethnicity. It is noticed that the age group over 34 contains a wider age range, hence result would be less intuitive.
+
+
+#### 3.4 Combined Ethnicity and Age Analysis 
+
+```{r}
+# to get an overall view from census data against ethnicity
+ethnicity_age<- dbGetQuery(db, "
+ SELECT age_group,
+ ethnicity_group, 
+ SUM(observation) AS Populatoin
+ FROM ethnicity_age_sex_census psex 
+ GROUP BY Age_Group, ethnicity_group
+")
+```
+
+
+```{r,eval=FALSE}
+ethnicity_age
+```
+
+
+```{r}
+ethnicity_age_sum <- dbGetQuery(db, "
+ SELECT 
+    age_range,
+    combined_ethnicity,
+    COUNT(*) AS number_of_searches,
+    
+    COUNT(*)/3 AS average_number_of_searches,
+    
+    (COUNT(*) * 1000.0) / 
+     (3* (SELECT SUM(REPLACE(pae.Population, ',', '') + 0)FROM age_ethnicity pae
+       WHERE pae.age_group = ss.age_range AND pae.ethnicity = ss.combined_ethnicity) )AS searches_per_1000_population,
+       
+     (COUNT(*) * 100.0) / (SELECT COUNT(*) FROM stop_and_searches_2021_2023 WHERE age_range IS NOT NULL  AND combined_ethnicity IS NOT NULL) AS search_percentage,
+    
+    (SUM(CASE WHEN outcome_linked_to_object_of_search =TRUE THEN 1 ELSE 0 END) *100)/ NULLIF(COUNT(*), 0) AS percentage_reasonable
+    
+FROM stop_and_searches_2021_2023 ss
+WHERE age_range IS NOT NULL  AND combined_ethnicity IS NOT NULL
+GROUP BY age_range,combined_ethnicity
+")
+
+ethnicity_age_sum$searches_per_1000_population <- format(ethnicity_age_sum$searches_per_1000_population, scientific = FALSE)
+ethnicity_age_sum$search_percentage <- format(ethnicity_age_sum$search_percentage, scientific = FALSE)
+```
+
+
+```{r,eval=FALSE}
+ethnicity_age_sum
+```
+
+
+```{r}
+ethnicity_age_df_year <- dbGetQuery(db, "
+ SELECT 
+    year,
+    age_range,
+    combined_ethnicity,
+    COUNT(*) AS number_of_searches,
+    
+    (COUNT(*) * 1000.0) / 
+     ((SELECT SUM(REPLACE(pae.Population, ',', '') + 0)FROM age_ethnicity pae 
+       WHERE pae.age_group = ss.age_range AND pae.ethnicity = ss.combined_ethnicity) )AS searches_per_1000_population_per_year,
+       
+    (COUNT(*) * 100.0) / 
+    (SELECT COUNT(*) FROM stop_and_searches_2021_2023 WHERE year = ss.year AND age_range IS NOT NULL AND combined_ethnicity IS NOT NULL ) AS search_percentage,
+    
+    (SUM(CASE WHEN outcome_Linked_to_object_of_search = TRUE THEN 1 ELSE 0 END)*100) / NULLIF(COUNT(*), 0)  AS percentage_reasonable
+    
+FROM stop_and_searches_2021_2023 ss
+WHERE age_range IS NOT NULL  AND combined_ethnicity IS NOT NULL 
+GROUP BY year,age_range,combined_ethnicity
+")
+
+ethnicity_age_df_year$search_percentage <- format(ethnicity_age_df_year$search_percentage, scientific = FALSE)
+```
+
+
+```{r,eval=FALSE}
+ethnicity_age_df_year
+```
+
+
+```{r}
+library(ggplot2)
+
+ethnicity_age_sum$searches_per_1000_population <- as.numeric(ethnicity_age_sum$searches_per_1000_population)
+
+# If there are no non-numeric characters, you can convert directly to numeric
+# age_sex_sum$searches_per_1000_population <- as.numeric(age_sex_sum$searches_per_1000_population)
+
+# Now round and convert to integer
+ethnicity_age_sum$searches_per_1000_population <- as.integer(round(ethnicity_age_sum$searches_per_1000_population))
+
+my_colors <- c("#E69F00", "#56B4E9", "#009E73", "#F0E442", "#0072B2", "#D55E00", "#CC79A7")
+# Plotting the bar chart
+ggplot(ethnicity_age_sum, aes(x = age_range, y = average_number_of_searches, fill = combined_ethnicity)) +
+  geom_bar(stat = "identity", position = "dodge", alpha = 1) +
+  scale_fill_manual(values = my_colors) + 
+  scale_y_continuous(labels = label_number(big.mark = ",")) +  # This will format numbers with commas
+  labs(
+    caption = "Note:\n• Does not include vehicle only searches.\n• Does not include searches record whose ethnicity is unknown.\n• Does not include searches record whose age is unknown.",
+    title = "Average Number of Searches by Age Group and Ethnicity ",
+    subtitle = "from year 2021 to 2023 based on 2021 Census",
+    x = "Age Group",
+    y = "Average Number of Searches"
+  ) +
+  theme_minimal()+
+   theme(
+    plot.caption = element_text(hjust = 0), # Left-align the text within the caption
+    plot.caption.position = "plot", # Center the caption box itself at the bottom of the plot
+    plot.subtitle = element_text(hjust = 0.5))# Center-align the subtitle
+
+
+# Plotting the bar chart
+ggplot(ethnicity_age_sum, aes(x = age_range, y = searches_per_1000_population, fill = combined_ethnicity)) +
+  geom_bar(stat = "identity", position = "dodge", alpha = 1) +
+  scale_fill_manual(values = my_colors) + 
+  scale_y_continuous(labels = label_number(big.mark = ",")) +  # This will format numbers with commas
+  labs(
+    caption = "Note: \n• Does not include vehicle only searches.\n• Does not include searches record whose ethnicity is unknown.\n• Does not include searches record whose age is unknown.",
+    title = "Average Searches per 1000 Population by Age Group and Ethnicity",
+    subtitle = "from year 2021 to 2023 based on 2021 Census",
+    x = "Age Group",
+    y = "Searches per 1000 Population"
+  ) +
+  theme_minimal() +
+  theme(
+    plot.caption = element_text(hjust = 0), # Left-align the text within the caption
+    plot.caption.position = "plot", # Center the caption box itself at the bottom of the plot
+    plot.subtitle = element_text(hjust = 0.5))# Center-align the subtitle
+```
+
+Group bar charts show average search frequency and rate by age within each ethnic group from 2021 to 2023.
+
+It highlights acute biases, particularly against Black individuals aged 18-24. The data shows this group faces significantly higher search rates, underscoring the compounded effect of age and ethnicity in policing biases.
+
+
+#### 3.5 Combined Age and Sex Analysis 
+
+```{r}
+# this part is I summarize the data from each database first to test whether I calculate write figure in the SQL
+age_sex<- dbGetQuery(db, "
+ SELECT age_group,
+ sex, 
+ SUM(observation) AS Populatoin
+ FROM ethnicity_age_sex_census psex 
+ GROUP BY age_group, sex
+")
+
+ 
+age_sex_census<- dbGetQuery(db, "
+ SELECT age_range,
+ gender, 
+ COUNT(*) AS number_of_searches
+ FROM stop_and_searches_2021_2023 
+ GROUP BY age_range, gender
+")
+```
+
+
+```{r,eval=FALSE}
+age_sex
+age_sex_census
+```
+
+
+```{r}
+age_sex_sum <- dbGetQuery(db, "
+ SELECT 
+    age_range,
+    gender,
+    COUNT(*) AS number_of_searches,
+    
+    COUNT(*)/3 AS average_number_of_searches,
+    
+    (COUNT(*) * 1000.0) / 
+     (3 * (SELECT SUM(REPLACE(pas.observation, ',', '') + 0)
+           FROM ethnicity_age_sex_census pas 
+           WHERE pas.age_group = ss.age_range AND pas.sex = ss.gender)
+     ) AS searches_per_1000_population,
+    
+    (SELECT SUM(REPLACE(pas.observation, ',', '') + 0) 
+     FROM ethnicity_age_sex_census pas 
+     WHERE pas.age_group = ss.age_range AND pas.sex = ss.gender) * 100.0 / 
+    (SELECT SUM(REPLACE(pas.observation, ',', '') + 0) 
+     FROM ethnicity_age_sex_census pas) AS population_percentage,
+    
+    (COUNT(*) * 100.0) / 
+    (SELECT COUNT(*) FROM stop_and_searches_2021_2023 WHERE age_range IS NOT NULL AND gender IS NOT NULL AND gender NOT IN ('Other')) AS search_percentage,
+    
+    (SUM(CASE WHEN outcome_Linked_to_object_of_search = TRUE THEN 1 ELSE 0 END) * 1.0) / NULLIF(COUNT(*), 0) * 100 AS percentage_reasonable
+    
+ FROM stop_and_searches_2021_2023 ss
+ WHERE age_range IS NOT NULL AND gender IS NOT NULL AND gender NOT IN ('Other')
+ GROUP BY age_range, gender
+")
+
+age_sex_sum$searches_per_1000_population <- format(age_sex_sum$searches_per_1000_population, scientific = FALSE)
+age_sex_sum$search_percentage <- format(age_sex_sum$search_percentage, scientific = FALSE)
+```
+
+
+```{r,eval=FALSE}
+age_sex_sum
+
+```
+
+
+```{r}
+library(ggplot2)
+library(dplyr)
+library(tidyr)
+age_sex_sum$population_percentage <- as.numeric(as.character(age_sex_sum$population_percentage))
+age_sex_sum$search_percentage <- as.numeric(as.character(age_sex_sum$search_percentage))
+
+# Convert the data to long format
+df_long <- age_sex_sum %>%
+  pivot_longer(cols = c(population_percentage, search_percentage),
+               names_to = "metric", values_to = "percentage") %>%
+  mutate(percentage = if_else(metric == "population_percentage", -percentage, percentage),
+         metric = factor(metric, levels = c("population_percentage", "search_percentage"))) %>%
+  unite("metric_gender", metric, gender, sep = "_") # Combine metric and sex into one column
+
+# Define the width for dodging
+dodge_width <- 0.9
+
+# Plot
+ggplot(df_long, aes(x = age_range, y = percentage, fill = metric_gender)) +
+  geom_bar(stat = "identity", position = position_dodge(width = dodge_width)) +
+  coord_flip() + 
+  scale_y_continuous(labels = abs, 
+                     breaks = seq(-100, 100, by = 10), 
+                     limits = c(-max(abs(df_long$percentage)), max(abs(df_long$percentage)))) +
+  scale_fill_manual(values = c("population_percentage_Female" = "red", 
+                               "population_percentage_Male" = "blue",
+                               "search_percentage_Female" = "lightpink",
+                               "search_percentage_Male" = "lightblue")) +
+  labs(x = "Age Group", y = "Percentage", fill = "Group",
+        title = "Average Searches Percentage versus Population Percentage by Age Goup and Gender",
+    subtitle = "from year 2021 to 2023 based on 2021 Census",
+    caption = "Note: \n• Does not include vehicle only searches.\n• Does not include searches record whose age is unknown.\n• Does not include searches record whose gender is unknown.",) +
+  theme_minimal() +
+  
+  theme(plot.subtitle = element_text(hjust = 0.5))+# Center-align the subtitle
+  theme(legend.position = "right",  plot.title = element_text(size = 10))+
+  theme(
+    plot.caption = element_text(hjust = 0), # Left-align the text within the caption
+    plot.caption.position = "plot" # Center the caption box itself at the bottom of the plot
+  )
+
+
+```
+
+Bar chart compares average search proportion from 2021 to 2023 with population proportion between males and females across age groups.
+
+Males consistently experience higher search rates than females in all age groups. This disparity is particularly evident in the over 25 age group, despite a larger female population.
+
+
+
+#### 3.6 Force-Based Analysis 
+
+```{r}
+
+
+unique_values_in_force <- unique(stop_and_searches_2021_2023$force)
+
+
+force_df_sum <- dbGetQuery(db, "
+SELECT force FROM stop_and_searches_2021_2023 GROUP BY force")
+```
+
+
+```{r,eval=FALSE}
+# to assess data consistent
+unique_values_in_force
+force_df_sum
+```
+
+
+```{r}
+force_df_sum <- dbGetQuery(db, "
+SELECT 
+    force,
+    COUNT(*) AS total_number_of_searches_21_23,
+    COUNT(*) / 3 AS average_number_of_searches,
+    (COUNT(*) * 1000.0) / (3 * (SELECT SUM(REPLACE(p.Population, ',', '') + 0) 
+                               FROM population_by_force_by_ethnicity_21census p 
+                               WHERE p.`Police.Force.Area` = ss.force)) 
+    AS searches_per_1000_population,
+    (COUNT(*) * 100.0) / (SELECT COUNT(*) 
+                          FROM stop_and_searches_2021_2023 
+                          WHERE year = ss.year  ) 
+    AS search_percentage,
+    (SUM(CASE WHEN outcome_Linked_to_object_of_search = TRUE THEN 1 ELSE 0 END) * 100.0) / 
+    NULLIF(COUNT(*), 0) AS percentage_reasonable
+FROM stop_and_searches_2021_2023 ss
+GROUP BY ss.force
+
+")
+```
+
+
+```{r,eval=FALSE }
+force_df_sum
+```
+
+
+```{r}
+force_df_year <- dbGetQuery(db, "
+ SELECT
+    force,
+    COUNT(*) AS total_number_of_searches_21_23,
+    
+    (COUNT(*) * 1000.0) /  (SELECT SUM(REPLACE(p.Population, ',', '') + 0) 
+                               FROM population_by_force_by_ethnicity_21census p 
+                               WHERE p.`Police.Force.Area` = ss.force)
+    AS searches_per_1000_population,
+    
+    
+    (COUNT(*) * 100.0) / (SELECT COUNT(*) 
+                          FROM stop_and_searches_2021_2023 
+                          WHERE year = ss.year AND force IS NOT NULL ) 
+    AS search_percentage,
+    
+    (SUM(CASE WHEN outcome_Linked_to_object_of_search = TRUE THEN 1 ELSE 0 END) * 100.0) / 
+    NULLIF(COUNT(*), 0) AS percentage_reasonable
+FROM stop_and_searches_2021_2023 ss
+WHERE ss.force IS NOT NULL
+GROUP BY year,ss.force")
+```
+
+
+```{r,eval=FALSE}
+force_df_year
+```
+
+
+
+```{r,eval=FALSE}
+library(sf)
+library(dplyr)
+
+# Define the path to your folder containing KML files
+folder_path <- "force kmls"
+
+# List all KML files in the folder
+kml_files <- list.files(folder_path, pattern = "\\.kml$", full.names = TRUE)
+
+# Read all KML files and combine them into one sf object
+all_kml_data <- lapply(kml_files, st_read) %>% 
+  bind_rows()
+
+# Now  can plot all the boundaries
+#ggplot() +
+  geom_sf(data = all_kml_data)
+
+```
+
+```{r}
+
+# download and import the force boundary data from police.data.uk
+library(sf)
+library(dplyr)
+
+# Define the path to your folder containing KML files
+folder_path <- "force kmls"
+
+# List all KML files in the folder
+kml_files <- list.files(folder_path, pattern = "\\.kml$", full.names = TRUE)
+
+# Read all KML files, assign the file name (without .kml extension) to the 'Name' column, and combine into one sf object
+all_kml_data <- lapply(kml_files, function(file) {
+  kml_data <- st_read(file)
+  # Remove the .kml extension from the file name
+  kml_data$Name <- gsub(".kml", "", basename(file), fixed = TRUE)
+  return(kml_data)
+}) %>% bind_rows()
+
+# Now we can plot all the boundaries with names filled in
+ggplot() +  geom_sf(data = all_kml_data, aes(fill = Name))  # Fill based on the Name column
+
+#store at local 
+saveRDS(all_kml_data, "all_kml_data.rds")
+
+```
+
+```{r}
+all_kml_data <- readRDS("all_kml_data.rds")
+# Unique names from all_kml_data_update
+unique_names <- unique(all_kml_data$Name)
+
+# Unique police_force_area from force_df_sum
+unique_police_force_areas <- unique(force_df_sum$force)
+
+# Check unmatched names in both directions
+unmatched_names_in_force_df_sum <- unique_police_force_areas[!unique_police_force_areas %in% unique_names]
+unmatched_names_in_all_kml_data <- unique_names[!unique_names %in% unique_police_force_areas]
+
+# Print unmatched names
+print("Unmatched Names in force_df_sum:")
+print(unmatched_names_in_force_df_sum)
+
+print("Unmatched Names in all_kml_data:")
+print(unmatched_names_in_all_kml_data)
+```
+
+
+
+
+```{r,eval=FALSE}
+## This is a sample indication of how t use downloaded archive data as additional data ( partial date from Gwent and North yorkshire )for the research, however running this chunk directly would report error as the total amount of data rows in more rows than dplyr can handle, which mean there are some manipulation needed to do handle this,  I give a sample to use filter function to remove rows contain NA. Another methods is to group data and add a column called search, which contains the number of search in same defined search category. I would show how to edit the code in the appendix with that format statistical data from financial year 2020 to 2022 ( Mar 2021 to Mar 2023.)
+
+library(readr)
+library(dplyr)
+
+# Function to read all CSVs in a folder, add a modified 'force' column based on the file name
+read_csvs_and_add_modified_force <- function(folder) {
+  csv_files <- list.files(folder, pattern = "\\.csv$", full.names = TRUE)
+
+  if (length(csv_files) == 0) {
+    message("No CSV files found in ", folder)
+    return(NULL)  # Return NULL if no files are found
+  }
+
+  all_data <- lapply(csv_files, function(file) {
+    data <- read_csv(file)
+    # Extract the relevant part of the filename for 'force'
+    force_name <- sub("^\\d{4}-\\d{2}-(.*)-stop-and-search.*$", "\\1", basename(file))
+    data <- mutate(data, force = force_name)
+    return(data)
+  })
+
+  return(bind_rows(all_data))
+}
+
+# Folder path
+folder_path <- "additional data"  # Replace with your actual folder path
+
+# Read and combine all CSVs from the folder
+combined_data <- read_csvs_and_add_modified_force(folder_path)
+
+colnames(combined_data)
+colnames(stop_and_searches_2021_2023)
+
+
+# Renaming columns in combined_data to match those in stop_and_searches_2021_2023
+combined_data <- combined_data %>%
+  rename(
+    type = Type,
+    datetime = Date,
+    location.latitude = Latitude,
+    location.longitude = Longitude,
+    gender = Gender,
+    age_range = `Age range`,
+    self_defined_ethnicity = `Self-defined ethnicity`,
+    officer_defined_ethnicity = `Officer-defined ethnicity`,
+    legislation = Legislation,
+    object_of_search = `Object of search`,
+    outcome_object.name = Outcome,
+    outcome_linked_to_object_of_search = `Outcome linked to object of search`,
+    force = force
+  )
+
+##
+combined_data_filtered <- combined_data %>%
+  filter( !is.na(gender) & !is.na(age_range) )
+
+
+# Joining combined_data and stop_and_searches_2021_2023
+# Replace 'type' with the appropriate column(s) for joining
+joined_data <- inner_join(combined_data, stop_and_searches_2021_2023, by = "type")
+
+```
+
+
+
+```{r}
+
+
+map_to_plot<- right_join(force_df_sum , all_kml_data, by = c("force" = "Name"))
+# After the join, map_to_plot will include all rows from force_df_sum and matching rows from all_kml_data_update, including the one with empty geometry.
+
+
+
+# This will remove rows where the geometry is empty (including 'MULTIPOLYGON Z EMPTY')
+map_to_plot_filtered<- map_to_plot %>%
+  filter(!st_is_empty(geometry))
+```
+
+
+
+```{r,eval=FALSE}
+library(sf)
+```
+
+
+```{r}
+# Check if map_to_plot is still an sf object
+#class(map_to_plot_filtered)
+
+# If map_to_plot is not an sf object,I  need to convert it back
+
+if (!"sf" %in% class(map_to_plot_filtered)) {
+  map_to_plot_filtered <- st_as_sf(map_to_plot_filtered)
+}
+
+
+# Check the class again
+#class(map_to_plot_filtered)
+
+# Check rows with empty geometry
+rows_with_empty_geometry <- map_to_plot_filtered[which(st_is_empty(st_geometry(map_to_plot_filtered))), ]
+
+rows_with_empty_geometry <- map_to_plot_filtered[which(st_is_empty(st_geometry(map_to_plot_filtered))), ]
+
+# Count the number of such rows
+num_rows_with_empty_geometry <- nrow(rows_with_empty_geometry)
+
+# Print the count
+print(paste("Number of rows with 'MULTIPOLYGON Z EMPTY' geometry:", num_rows_with_empty_geometry))
+
+# Optionally, view the rows with empty geometry
+if (num_rows_with_empty_geometry > 0) {
+  print(rows_with_empty_geometry$police_force_area)
+}
+
+```
+
+
+
+```{r,eval=FALSE}
+library("sf")
+library("tmap")
+library("classInt")
+```
+
+
+
+```{r,eval=FALSE}
+library(sf)
+library(ggplot2)
+library(dplyr)
+install.packages("ggspatial")
+library(ggspatial)
+```
+
+
+```{r}
+# Identify the highest value and second highest value
+highest_value <- max(map_to_plot_filtered$searches_per_1000_population, na.rm = TRUE)
+second_highest_value <- sort(map_to_plot_filtered$searches_per_1000_population, decreasing = TRUE)[2]
+highest_location <- st_centroid(map_to_plot_filtered[which.max(map_to_plot_filtered$searches_per_1000_population), ])
+
+# Plot with ggplot
+map_rate <- ggplot(map_to_plot_filtered) +
+  geom_sf(aes(fill = searches_per_1000_population)) +
+  geom_sf(data = highest_location, color = "red", size = 3, shape = 8) + # Shape 8 is a star
+  scale_fill_viridis_c(
+    name = "Relative Search Rate per 1000 Population",
+    limits = c(0, second_highest_value),  # Set the limits excluding the highest value
+    option = "D"
+  ) +
+  labs(title = "Average Search Rate Distribution by Police Force from 2021 to 2023",
+       
+    caption = "Note: \n• The red star indicates the force area with the highest value of searches per 1000 population:City of London at 295. \n• Grey Area indicates where stop and search data is missing due to technical issues from DATA.POLICE.UK"
+  ) +
+  theme_minimal() +
+  theme(legend.position = "right", plot.caption = element_text(hjust = 0))+
+  annotation_scale(location = "bl")
+  
+
+# Print the map
+print(map_rate)
+
+library("plotly")
+#ggplotly(map_rate) #interactive map plot to help discover regional difference in detail
+
+
+```
+
+```{r}
+library(ggplot2)
+library(sf)
+library(viridis)
+
+library(ggplot2)
+library(sf)
+
+
+# Identify the highest value and its index
+highest_value <- max(map_to_plot_filtered$average_number_of_searches, na.rm = TRUE)
+highest_index <- which.max(map_to_plot_filtered$average_number_of_searches)
+
+# Create a subset for the highest value area
+highest_area <- map_to_plot_filtered[highest_index, ]
+
+# Plot with ggplot
+map_rate <- ggplot(map_to_plot_filtered) +
+  geom_sf(aes(fill = average_number_of_searches), lwd = 0.2) + # Fill based on the average number of searches
+  scale_fill_viridis_c(
+    name = "Average Number of Searches",
+    option = "D",
+    limits = c(0, 40000), # Set fixed limits for the color scale
+    breaks = c(0, 10000, 20000, 30000, 40000), # Set breaks for the legend
+    oob = scales::oob_squish # Keep out-of-bounds data points
+  ) +
+  geom_sf(data = highest_area, fill = "red", lwd = 0.2) + # Overlay the highest area in red
+  labs(title = "Average Search Frequency Distribution by Police Force from 2021 to 2023",
+    caption = paste("Note: \n• The red area indicates the force area with the highest average searches from 2021 to 2023:",
+                    "City of London at", highest_value, ".\n• Grey Area indicates where stop and search data is missing due to technical issues from DATA.POLICE.UK")
+  ) +
+  theme_minimal() +
+  theme(legend.position = "right", plot.caption = element_text(hjust = 0)) +
+  annotation_scale(location = "bl")
+
+# Print the map
+print(map_rate)
+
+library("plotly")
+# ggplotly(map_rate) #interactive map plot to help discover regional difference in detail
+
+```
+
+Maps show search rates and average search frequency from 2021 to 2023 by police force area.
+
+The City of London exhibits the highest search rates, followed by Merseyside and the Metropolitan area. Notably, the Metropolitan area leads in the total number of searches.
+
+```{r,eval=FALSE}
+# Alternative methods to use tamp to draw the graph with interactive map we could directly identify the force and its figure to help write report
+
+# Load required libraries
+library(sf)
+library(tmap)
+library(dplyr)
+map <- tm_shape(map_to_plot_filtered) +
+  tm_polygons("average_number_of_searches")
+
+# Let's improve the map by creating more visual variation with our bins: 
+breaks <- classInt::classIntervals(map_to_plot_filtered$average_number_of_searches, n = 5, style = "jenks", dig.lab=10)
+breaks
+
+map_to_plot_filtered <- map_to_plot_filtered |>
+  mutate(number_of_searches_cut = cut(average_number_of_searches, breaks$brks, include.lowest = TRUE, dig.lab=10))
+
+map <- tm_shape(map_to_plot_filtered) +
+  tm_polygons("average_number_of_searches", palette = "Reds", title = "Average Number of Searches") +
+  tm_layout(main.title = " UK Police Stop and Search, 2020-2023", legend.outside = TRUE, frame = FALSE)+
+  tm_compass(position = c("right", "bottom")) +
+  tm_scale_bar(position = c("right", "bottom"))
+
+# Finally, we can create a dynamic "live" map using tmaps:
+tmap_options(check.and.fix = TRUE) 
+tmap_mode("view")
+map
+
+tmap_save(map, "UK_stop_and_search.html")
+tmap_mode("plot")
+
+
+
+
+map <- tm_shape(map_to_plot_filtered) +
+  tm_polygons("searches_per_1000_population")
+
+# Let's improve the map by creating more visual variation with our bins: 
+breaks <- classInt::classIntervals(map_to_plot_filtered$searches_per_1000_population, n = 5, style = "jenks", dig.lab=10)
+breaks
+
+map_to_plot_filtered <- map_to_plot_filtered |>
+  mutate(number_of_searches_cut = cut(searches_per_1000_population, breaks$brks, include.lowest = TRUE, dig.lab=10))
+
+map <- tm_shape(map_to_plot_filtered) +
+  tm_polygons("average_number_of_searches", palette = "Reds", title = "Number of Searches Per 1000 Population") +
+  tm_layout(main.title = " UK Police Stop and Search, 2020-2023", legend.outside = TRUE, frame = FALSE)+
+  tm_compass(position = c("right", "bottom")) +
+  tm_scale_bar(position = c("right", "bottom"))
+
+# Finally, we can create a dynamic "live" map using tmaps:
+tmap_options(check.and.fix = TRUE) 
+tmap_mode("view")
+map
+
+tmap_save(map, "UK_stop_and_search.html")
+tmap_mode("plot")
+```
+
+
+#### 3.7 Daily and Hourly Search Frequency 
+
+```{r}
+library(dplyr)
+library(lubridate)
+
+# Parse the datetime, extract the hour, and create the daytime range
+stop_and_searches_2021_2023 <- stop_and_searches_2021_2023 %>%filter(!is.na(datetime)) %>%
+  mutate(datetime = ymd_hms(datetime), # Parse the datetime string
+         hour = hour(datetime), # Extract the hour
+         daytime = sprintf("%02d:00-%02d:59", hour, hour)) # Format hour range
+
+# Count the number of records for each hour range
+hourly_counts <- stop_and_searches_2021_2023 %>%
+  group_by(daytime) %>%
+  summarise(count = n())
+
+# Calculate the total number of occurrences
+total_count <- sum(hourly_counts$count)
+
+# Calculate the percentage for each hour range
+hourly_counts <- hourly_counts %>%
+  mutate(percentage = (count / total_count) * 100)
+
+# View the result
+#print(hourly_counts)
+```
+
+
+```{r}
+library(ggplot2)
+
+# Plotting the bar chart
+ggplot(hourly_counts, aes(x = daytime, y = count)) +
+  geom_bar(stat = "identity", fill = "steelblue") +
+  geom_text(aes(label = count), vjust = -0.3, color = "black", size = 2.5) + 
+  labs(x = "Day Time", 
+       y = "Number of searches", 
+       title = "Number of Search Frequency of Searches by Day Time in Hour") +
+  
+  theme_minimal()+
+  theme(axis.text.x = element_text(angle = 90, hjust = 1)) # Rotate x-axis labels for better readability
+```
+
+
+```{r}
+library(dplyr)
+library(lubridate)
+
+# Add a new column for the day of the week
+stop_and_searches_2021_2023 <- stop_and_searches_2021_2023 %>%filter(!is.na(datetime)) %>%
+  mutate(datetime = ymd_hms(datetime), # Parse the datetime string
+         day_of_week = wday(datetime, label = TRUE)) # Extract day of week with label
+
+# Count the number of searches for each day of the week
+day_of_week_counts <- stop_and_searches_2021_2023 %>%
+  group_by(day_of_week) %>%
+  summarise(count = n())
+
+# Calculate the total number of searches
+total_searches <- sum(day_of_week_counts$count)
+
+# Calculate the percentage for each day of the week
+day_of_week_counts <- day_of_week_counts %>%
+  mutate(percentage = (count / total_searches) * 100)
+
+# View the result
+#print(day_of_week_counts)
+```
+
+
+```{r}
+
+library(ggplot2)
+
+# Plotting the bar chart
+ggplot(day_of_week_counts, aes(x = day_of_week, y = count)) +
+  geom_bar(stat = "identity", fill = "steelblue") +
+  geom_text(aes(label = count), vjust = -0.3, color = "black", size = 2.5) + 
+  labs(x = "Day", 
+       y = "Number of searches", 
+       title = "Number of Search Frequency of Searches by Day ") +
+  
+  theme_minimal()
+
+```
+
+Bar charts depicting search frequency throughout the day and across different days of the week.
+
+A concentration of searches between 4 PM and 1 AM, declining in the morning, indicates a focus on evening and nighttime. Searches are less frequent on Sundays, peaking on Fridays. This uneven distribution across times and days could skew results, potentially overemphasizing certain behaviors or demographic groups with bias.
+
+
+## Appendix: All code in this assignment
+
+```{r ref.label=knitr::all_labels(), echo=TRUE, eval=FALSE} 
+# this chunk generates the complete code appendix. 
+# eval=FALSE tells R not to run (``evaluate'') the code here (it was already run before).
+```
+
+
+
+
+
+```{r}
+
+# Below shows how to use open statistical data from financial year to plot the map, which has the data of missing forces
+#install.packages(c("DBI", "RSQLite"))
+library(DBI)
+
+
+stop_search_mar21_mar23 <- read.csv("stop-search-open-data-tables-mar21-mar23.csv")
+
+
+dbWriteTable(db, "stop_search_mar21_mar23", stop_search_mar21_mar23, row.names = FALSE, overwrite = TRUE)
+tables <- dbListTables(db)
+#print(tables)
+#dbListFields(db,"stop_search_mar21_mar23")
+```
+
+```{r}
+
+force_df_sum2 <- dbGetQuery(db, "
+ SELECT 
+     police_force_area,
+    SUM(ss.number_of_searches) AS number_of_searches,
+    SUM(ss.number_of_searches)/3 AS average_number_of_searches,
+    (SUM(ss.number_of_searches) * 1000.0) / 
+     (3* (SELECT SUM(REPLACE(p.Population, ',', '') + 0)FROM population_by_force_by_ethic_21census p 
+       WHERE p.`Police.Force.Area` = ss.police_force_area) )AS searches_per_1000_population,
+    (SUM(ss.number_of_searches) * 100.0) / (SELECT SUM(number_of_searches) FROM stop_search_mar21_mar23 WHERE police_force_area NOT IN ('Unknown', 'N/A - vehicle search') ) AS search_percentage,
+    SUM(CASE WHEN link IN ('Linked', 'Not linked', 'Unknown link') THEN 1.0 ELSE 0 END) / NULLIF(SUM(ss.number_of_searches), 0) * 100 AS percentage_reasonable
+FROM stop_search_mar21_mar23 ss
+WHERE police_force_area NOT IN ('Unknown', 'N/A - vehicle search') 
+GROUP BY police_force_area
+")
+force_df_sum2
+
+force_df_year2 <- dbGetQuery(db, "
+ SELECT 
+     financial_year,
+     police_force_area,
+     
+    SUM(ss.number_of_searches) AS number_of_searches,
+    
+    (SUM(ss.number_of_searches) * 1000.0) / 
+     ((SELECT SUM(REPLACE(p.Population, ',', '') + 0)FROM population_by_force_by_ethic_21census p 
+       WHERE p.`Police.Force.Area` = ss.police_force_area) )AS searches_per_1000_population,
+       
+       (SUM(ss.number_of_searches) * 100.0) / (SELECT SUM(number_of_searches) FROM stop_search_mar21_mar23 WHERE financial_year = ss.financial_year AND police_force_area NOT IN ('Unknown', 'N/A - vehicle search') ) AS search_percentage,
+       
+    SUM(CASE WHEN link IN ('Linked', 'Not linked', 'Unknown link') THEN 1.0 ELSE 0 END) / NULLIF(SUM(ss.number_of_searches), 0) * 100 AS percentage_reasonable
+    
+FROM stop_search_mar21_mar23 ss
+WHERE police_force_area NOT IN ('Unknown', 'N/A - vehicle search') 
+GROUP BY financial_year,police_force_area
+")
+force_df_year2
+```
+
+
+```{r}
+
+# Update the 'Name' column
+library(dplyr)
+library(stringr)
+
+all_kml_data_update <- all_kml_data %>%
+  mutate(Name = gsub("-", " ", Name),           # Replace "-" with space
+         Name = gsub(" and ", " & ", Name),     # Replace " and " with " & "
+         Name = str_to_title(Name),             # Capitalize each word
+         # Handle specific cases
+         Name = if_else(Name == "City Of London", "London, City of", Name),
+         Name = if_else(Name == "Dyfed Powys", "Dyfed-Powys", Name),
+         Name = if_else(Name == "Metropolitan", "Metropolitan Police", Name))
+
+all_kml_data_update
+
+#Now the dataframe `all_kml_data_update` is ready to do a join with `force_df_sum` based on the column matching ` police_force_area == Name`
+```
+```{r}
+# Unique names from all_kml_data_update
+unique_names <- unique(all_kml_data_update$Name)
+
+# Unique police_force_area from force_df_sum
+unique_police_force_areas2 <- unique(force_df_sum2$police_force_area)
+
+# Check unmatched names in both directions
+unmatched_names_in_force_df_sum2 <- unique_police_force_areas2[!unique_police_force_areas2 %in% unique_names]
+unmatched_names_in_all_kml_data_update <- unique_names[!unique_names %in% unique_police_force_areas2]
+
+# Print unmatched names
+print("Unmatched Names in force_df_sum:")
+print(unmatched_names_in_force_df_sum2)
+
+print("Unmatched Names in all_kml_data_update:")
+print(unmatched_names_in_all_kml_data_update)
+
+```
+
+
+```{r,eval=FALSE}
+#The official boundary does not contain the geometry of British Transport Police. So I did a research by running a web scrapping to collect the introduction and geometry for British Transport Police from Wikipedia. But then I found it is a national special police force that polices the railway network of England, Wales and Scotland. The boundary for it is the whole GB.
+
+
+library(dplyr)
+library(RSelenium)
+library(rvest)
+library("netstat")
+library(stringr)
+ driver <- rsDriver(browser = "firefox",  port = free_port(random = TRUE), chromever = NULL) 
+  remDr <- driver[["client"]]
+  url<-"https://en.wikipedia.org/wiki/British_Transport_Police"
+  remDr$navigate(url)
+  
+  html <- read_html(url)
+Intro_BTP <- html%>% html_elements(css=" .mw-content-ltr > p:nth-child(5)" )
+Intro_BTP_text <- Intro_BTP %>% html_text() 
+Intro_BTP_text
+
+# Scrape Operations jurisdiction information using CSS selector
+operations_jurisdiction <- html %>% html_elements(".infobox-data")
+operations_jurisdiction <- operations_jurisdiction[html %>% html_elements(".infobox-label") %>% html_text() == "Operations jurisdiction"] %>% html_text()
+print(operations_jurisdiction)
+
+      # Scrape Headquarters coordinates using CSS selector
+      coordinates <- html %>% html_elements(".geo-default") %>% html_text()
+      coordinates <- ifelse(length(coordinates) > 0, coordinates[[1]], "N/A")
+      
+      # Extract the part after the slash and remove unnecessary characters
+coordinates <- sub(".* / ", "", coordinates)
+coordinates <- gsub("; ", " ", coordinates)
+
+print(coordinates)
+```
+
+
+```{r}
+#combine 2 dataframe together using full join
+map_to_plot2<- full_join(force_df_sum2 , all_kml_data_update, by = c("police_force_area" = "Name"))
+
+# After the join, map_to_plot will include all rows from force_df_sum and matching rows from all_kml_data_update, including the one with empty geometry.
+```
+
+```{r}
+
+# Filter out rows with empty geometry
+map_to_plot_filtered2 <- map_to_plot %>%
+  filter(!st_is_empty(geometry))
+
+# This will remove rows where the geometry is empty (including 'MULTIPOLYGON Z EMPTY')
+
+```
+
+```{r}
+library(sf)
+
+# Check if map_to_plot is still an sf object
+class(map_to_plot_filtered2)
+
+# If map_to_plot is not an sf object,I  need to convert it back
+
+if (!"sf" %in% class(map_to_plot_filtered2)) {
+  map_to_plot_filtered2 <- st_as_sf(map_to_plot_filtered2)
+}
+
+# Check the class again
+class(map_to_plot_filtered2)
+
+# Check rows with empty geometry
+rows_with_empty_geometry <- map_to_plot_filtered2[which(st_is_empty(st_geometry(map_to_plot_filtered2))), ]
+```
+
+
+```{r}
+rows_with_empty_geometry <- map_to_plot_filtered2[which(st_is_empty(st_geometry(map_to_plot_filtered2))), ]
+
+# Count the number of such rows
+num_rows_with_empty_geometry <- nrow(rows_with_empty_geometry)
+
+# Print the count
+print(paste("Number of rows with 'MULTIPOLYGON Z EMPTY' geometry:", num_rows_with_empty_geometry))
+
+# Optionally, view the rows with empty geometry
+if (num_rows_with_empty_geometry > 0) {
+  print(rows_with_empty_geometry$police_force_area)
+}
+
+```
+
+
+
+```{r}
+library(sf)
+library(ggplot2)
+library(dplyr)
+install.packages("ggspatial")
+library(ggspatial)
+
+# Identify the highest value and its location
+highest_value <- max(map_to_plot_filtered2$searches_per_1000_population, na.rm = TRUE)
+
+# Identify the highest value and second highest value
+highest_value <- max(map_to_plot_filtered2$searches_per_1000_population, na.rm = TRUE)
+second_highest_value <- sort(map_to_plot_filtered2$searches_per_1000_population, decreasing = TRUE)[2]
+highest_location <- st_centroid(map_to_plot_filtered2[which.max(map_to_plot_filtered2$searches_per_1000_population), ])
+
+# Plot with ggplot
+map_rate <- ggplot(map_to_plot_filtered) +
+  geom_sf(aes(fill = searches_per_1000_population)) +
+  geom_sf(data = highest_location, color = "red", size = 3, shape = 8) + # Shape 8 is a star
+  scale_fill_viridis_c(
+    name = "Searches per 1000 Population",
+    limits = c(0, second_highest_value),  # Set the limits excluding the highest value
+    option = "D"
+  ) +
+  labs(
+    caption = "Note: \n• The red star indicates the force area with the highest value of searches per 1000 population:City of London at 295. \n• Grey Area indicates where stop and search data is missing due to technical issues from DATA.POLICE.UK"
+  ) +
+  theme_minimal() +
+  theme(legend.position = "right", plot.caption = element_text(hjust = 0))+
+  annotation_scale(location = "bl")
+  
+
+# Print the map
+print(map_rate)
+
+library("plotly")
+#ggplotly(map_rate). #interactive map plot to help discover regional difference in detail
+```
+
+
+```{r}
+library(sf)
+library(dplyr)
+
+map <- tm_shape(map_to_plot_filtered) +
+  tm_polygons("average_number_of_searches")
+
+# Let's improve the map by creating more visual variation with our bins: 
+breaks <- classInt::classIntervals(map_to_plot_filtered$average_number_of_searches, n = 5, style = "jenks", dig.lab=10)
+breaks
+
+map_to_plot_filtered <- map_to_plot_filtered |>
+  mutate(number_of_searches_cut = cut(average_number_of_searches, breaks$brks, include.lowest = TRUE, dig.lab=10))
+
+map <- tm_shape(map_to_plot_filtered) +
+  tm_polygons("average_number_of_searches", palette = "Reds", title = "Average Number of Searches") +
+  tm_layout(main.title = " UK Police Stop and Search, 2020-2023", legend.outside = TRUE, frame = FALSE)
+  
+map
+tmap_save(map, "UK_stop_and_search.png", dpi = 300)
+```
+
+
+```{r}
+# Finally, we can create a dynamic "live" map using tmaps:
+tmap_options(check.and.fix = TRUE) 
+tmap_mode("view")
+map
+
+tmap_save(map, "UK_stop_and_search.html")
+tmap_mode("plot")
+```
+

@@ -1,0 +1,1722 @@
+---
+title: "Final Assignment"
+author: "202075757"
+date: "AT 2023"
+output: html_document
+---
+
+This report investigates potential biases in stop-and-search practices by UK police officers,using alternative data, National Statistics, open data from financial year 2020 to 2022. The analysis focuses on the impact of the individual's sex, ethnicity, age group, and the area of the police force. By examining these variables, the study aims to uncover whether these stop-and-search practices are influenced by inherent biases.
+
+Apart from exact figure is different the result conslusion is the same with API data source.
+
+```{r setup, include=FALSE} 
+# this chunk contains code that sets global options for the entire .Rmd. 
+# we use include=FALSE to suppress it from the top of the document, but it will still appear in the appendix. 
+
+knitr::opts_chunk$set(echo = FALSE) # actually set the global chunk options. 
+# we set echo=FALSE to suppress code such that it by default does not appear throughout the document. 
+# note: this is different from .Rmd default
+```
+
+
+
+
+
+```{r}
+library("httr")
+library("jsonlite")
+library("tidyverse")
+library("jpeg") #to let us read .jpegs/.jpgs
+library("grid") #to let us plot images
+library(rvest)
+library(dplyr)
+```
+
+```{r}
+crimes_street_dates_url <- "https://data.police.uk/api/crimes-street-dates"
+
+fromJSON(crimes_street_dates_url)
+
+forces_url <- "https://data.police.uk/api/forces"
+
+fromJSON(forces_url)
+
+
+stop_and_searches_by_force_url <-"https://data.police.uk/api/stops-force?force=avon-and-somerset&date=2022-11"
+fromJSON(stop_and_searches_by_force_url)
+
+
+```
+
+
+
+
+
+
+
+```{r}
+#install.packages(c("DBI", "RSQLite"))
+library(DBI)
+
+# Create database: This will create a file in our hard drive if it does not exist already. 
+db <- dbConnect(RSQLite::SQLite(), "database/assignment4.sqlite")
+db_exists <- file.exists("database/assignment4.sqlite")
+db_exists
+
+stop_search_mar21_mar23 <- read.csv("stop-search-open-data-tables-mar21-mar23.csv")
+
+
+dbWriteTable(db, "stop_search_mar21_mar23", stop_search_mar21_mar23, row.names = FALSE, overwrite = TRUE)
+tables <- dbListTables(db)
+print(tables)
+dbListFields(db,"stop_search_mar21_mar23")
+```
+
+2021 census population data to eliminate the scale influence
+```{r}
+
+library(dplyr)
+
+population_by_force_by_ethic_21census<- read.csv("population-by-force-by-ethnicity.csv")
+population_by_force_by_ethic_21census <- population_by_force_by_ethic_21census %>%
+  mutate(
+    combinedethnicity = case_when(
+      grepl("Mixed|Other Ethnic Group", Self.defined.ethnicity) ~ "Mixed or Other",
+      TRUE ~ Self.defined.ethnicity
+    ),
+    Police.Force.Area = case_when(
+      Police.Force.Area == "Avon and Somerset" ~ "Avon & Somerset",
+      Police.Force.Area == "Devon and Cornwall" ~ "Devon & Cornwall",
+      TRUE ~ Police.Force.Area
+    )
+  )
+
+population_by_force_by_ethic_21census <- population_by_force_by_ethic_21census %>%
+  filter(Census.Year != 2011)
+
+
+population_by_age_sex_force_21cesnus <- read.csv("alternative-population-by-age-by-force.csv")
+
+population_by_age_sex_force_21cesnus <- population_by_age_sex_force_21cesnus %>%
+  mutate(combinedethnicity = case_when(
+    grepl("Asian", Self.defined.ethnicity) ~ "Asian or Asian British",
+    grepl("Black", Self.defined.ethnicity) ~ "Black or Black British",
+    grepl("Mixed|Other", Self.defined.ethnicity) ~ "Mixed or Other",
+    TRUE ~ Self.defined.ethnicity   # You can modify this default value as needed
+  ))
+population_by_age_sex_force_21cesnus$Population <- as.numeric(gsub(",", "", population_by_age_sex_force_21cesnus$Population)) # Remove commas if any and convert to numeric
+
+# Re-categorize the Age.group
+population_by_age_sex_force_21cesnus <- population_by_age_sex_force_21cesnus %>%
+  mutate(
+    New_Age_Group = case_when(
+      Age.group %in% c('0-9') ~ 'Under 10',
+      Age.group %in% c('10-14', '15-17') ~ '10-17',
+      Age.group %in% c('20-24') ~ '18-24',
+      Age.group %in% c('25-29') ~ '25-29',
+      Age.group %in% c('30-34', '35-39', '40-44', '45-49', '50-54', '55-59', '60-64', '65-69', '70-74', '75-79', '80-84', '85+') ~ '30 or over',
+      TRUE ~ Age.group # Catch-all to keep existing categories unchanged
+    )
+  )
+
+dbWriteTable(db, "population_by_age_sex_force_21cesnus", population_by_age_sex_force_21cesnus, row.names = FALSE, overwrite = TRUE)
+
+dbWriteTable(db, "population_by_force_by_ethic_21census", population_by_force_by_ethic_21census, row.names = FALSE, overwrite = TRUE)
+
+tables <- dbListTables(db)
+
+print(tables)
+dbListFields(db,"population_by_age_sex_force_21cesnus")
+
+dbListFields(db,"population_by_force_by_ethic_21census")
+```
+
+```{r}
+ethnicity_age_sex_census<- read.csv("alternative_ethnicity_age_sex_census.csv")
+colnames(ethnicity_age_sex_census)
+
+# Load the dplyr package if not already loaded
+library(dplyr)
+
+# Convert the "Age" column to numeric
+ethnicity_age_sex_census$Age <- as.numeric(ethnicity_age_sex_census$Age)
+
+# Define the age groups
+age_groups <- c("Under 10", "10-17", "18-24", "25-29", "30 or over")
+
+# Create a new column "Age_Group" based on the specified groups
+ethnicity_age_sex_census <- ethnicity_age_sex_census %>%
+  mutate(Age_Group = cut(Age, 
+                         breaks = c(-Inf, 10, 18, 25, 30, Inf),
+                         labels = age_groups,
+                         right = FALSE))
+
+# View the modified dataframe
+#View(ethnicity_age_sex_census)
+```
+
+
+```{r}
+# Load the required packages
+library(tidyr)
+library(dplyr)
+
+# Define the full column names to pivot
+columns_to_pivot <- c(
+  "Asian..Asian.British.or.Asian.Welsh..Bangladeshi.Female",
+  "Asian..Asian.British.or.Asian.Welsh..Bangladeshi.Male",
+  "Asian..Asian.British.or.Asian.Welsh..Chinese.Female",
+  "Asian..Asian.British.or.Asian.Welsh..Chinese.Male",
+  "Asian..Asian.British.or.Asian.Welsh..Indian.Female",
+  "Asian..Asian.British.or.Asian.Welsh..Indian.Male",
+  "Asian..Asian.British.or.Asian.Welsh..Pakistani.Female",
+  "Asian..Asian.British.or.Asian.Welsh..Pakistani.Male",
+  "Asian..Asian.British.or.Asian.Welsh..Other.Asian.Female",
+  "Asian..Asian.British.or.Asian.Welsh..Other.Asian.Male",
+  "Black..Black.British..Black.Welsh..Caribbean.or.African..African.Female",
+  "Black..Black.British..Black.Welsh..Caribbean.or.African..African.Male",
+  "Black..Black.British..Black.Welsh..Caribbean.or.African..Caribbean.Female",
+  "Black..Black.British..Black.Welsh..Caribbean.or.African..Caribbean.Male",
+  "Black..Black.British..Black.Welsh..Caribbean.or.African..Other.Black.Female",
+  "Black..Black.British..Black.Welsh..Caribbean.or.African..Other.Black.Male",
+  "Mixed.or.Multiple.ethnic.groups..White.and.Asian.Female",
+  "Mixed.or.Multiple.ethnic.groups..White.and.Asian.Male",
+  "Mixed.or.Multiple.ethnic.groups..White.and.Black.African.Female",
+  "Mixed.or.Multiple.ethnic.groups..White.and.Black.African.Male",
+  "Mixed.or.Multiple.ethnic.groups..White.and.Black.Caribbean.Female",
+  "Mixed.or.Multiple.ethnic.groups..White.and.Black.Caribbean.Male",
+  "Mixed.or.Multiple.ethnic.groups..Other.Mixed.or.Multiple.ethnic.groups.Female",
+  "Mixed.or.Multiple.ethnic.groups..Other.Mixed.or.Multiple.ethnic.groups.Male",
+  "White..English..Welsh..Scottish..Northern.Irish.or.British.Female",
+  "White..English..Welsh..Scottish..Northern.Irish.or.British.Male",
+  "White..Gypsy.or.Irish.Traveller.Female",
+  "White..Gypsy.or.Irish.Traveller.Male",
+  "White..Irish.Female",
+  "White..Irish.Male",
+  "White..Roma.Female",
+  "White..Roma.Male",
+  "White..Other.White.Female",
+  "White..Other.White.Male",
+  "Other.ethnic.group..Arab.Female",
+  "Other.ethnic.group..Arab.Male",
+  "Other.ethnic.group..Any.other.ethnic.group.Female",
+  "Other.ethnic.group..Any.other.ethnic.group.Male"
+)
+
+
+
+
+# Pivot the dataframe using pivot_longer
+ethnicity_age_sex_census_long <- ethnicity_age_sex_census %>%
+  pivot_longer(
+    cols = all_of(columns_to_pivot),
+    names_to = "ethnicity_sex",
+    values_to = "Population"
+  ) %>%
+  separate(ethnicity_sex, into = c("ethnicity", "sex"), sep = "\\.", remove = FALSE) %>%
+  mutate(sex = ifelse(grepl("Female", ethnicity_sex), "Female", "Male")) %>%
+  filter(Geography.Name == "England and Wales")
+# View the modified dataframe
+#View(ethnicity_age_sex_census_long)
+
+ethnicity_age_sex_census_long <- ethnicity_age_sex_census_long%>%
+mutate(ethnicity_group = case_when(
+    grepl("Asian", ethnicity) ~ "Asian or Asian British",
+    grepl("Black", ethnicity) ~ "Black or Black British",
+    grepl("Mixed|Other", ethnicity) ~ "Mixed or Other",
+    grepl("White", ethnicity) ~ "White",
+    TRUE ~ "Other"
+  )) %>%
+  select(-ethnicity)
+ 
+
+dbWriteTable(db, "ethnicity_age_sex_census_long", ethnicity_age_sex_census_long , row.names = FALSE, overwrite = TRUE)
+```
+
+
+
+```{r}
+
+
+age_population_df <- dbGetQuery(db,"
+SELECT 
+    `Age.group`,
+    SUM(REPLACE(Population, ',', '') + 0) AS TotalPopulation
+    FROM population_by_age_sex_force_21cesnus
+GROUP BY `Age.group`")
+age_population_df
+
+
+sex_population_df <- dbGetQuery(db, "
+ SELECT 
+    Sex,
+    SUM(REPLACE(Population, ',', '') + 0) AS TotalPopulation
+    FROM population_by_age_sex_force_21cesnus
+GROUP BY Sex")
+sex_population_df
+
+ethic_population_df <- dbGetQuery(db, "
+  SELECT 
+     combinedethnicity,
+     SUM(REPLACE(Population, ',', '') + 0) AS TotalPopulation
+  FROM population_by_force_by_ethic_21census
+  GROUP BY combinedethnicity")
+ethic_population_df
+```
+Initial  per 10000
+
+```{r}
+ethnicity_population_searches <- dbGetQuery(db, "
+  SELECT 
+  financial_year as year,
+    ss.combined_ethnicity AS ethnicity,
+    SUM(ss.number_of_searches) AS number_of_searches,
+     (SELECT SUM(REPLACE(p.Population, ',', '') + 0)FROM population_by_force_by_ethic_21census p 
+       WHERE p.combinedethnicity = ss.combined_ethnicity) AS total_population,
+    (SUM(ss.number_of_searches) * 1000.0) / 
+      (SELECT SUM(REPLACE(p.Population, ',', '') + 0)FROM population_by_force_by_ethic_21census p 
+       WHERE p.combinedethnicity = ss.combined_ethnicity) AS searches_per_1000_population,
+    SUM(CASE WHEN ss.link IN ('Linked', 'Not linked', 'Unknown link') THEN 1 ELSE 0 END) / 
+      NULLIF(SUM(ss.number_of_searches), 0) * 100 AS percentage_reasonable
+  FROM stop_search_mar21_mar23 ss
+  WHERE ss.combined_ethnicity NOT IN ('Unknown', 'N/A - vehicle search')
+  GROUP BY financial_year,ss.combined_ethnicity
+")
+
+
+ethnicity_population_searches
+
+
+# List column names in the 'stop_search_mar21_mar23' database
+columns_stop_search <- dbListFields(db, "stop_search_mar21_mar23")
+print(columns_stop_search)
+
+# List column names in the 'population_by_force_by_ethic_21census' database
+columns_population <- dbListFields(db, "population_by_force_by_ethic_21census")
+print(columns_population)
+
+# List column names in the 'population_by_age_sex_force_21cesnus' database
+columns_population <- dbListFields(db, "population_by_age_sex_force_21cesnus")
+print(columns_population)
+
+```
+
+```{r}
+ethnicity_dftest <- dbGetQuery(db, "
+    SELECT 
+    financial_year AS year,
+    sex,
+    SUM(number_of_searches) AS number_of_searches
+FROM stop_search_mar21_mar23
+GROUP BY sex,year
+ORDER BY year")
+ethnicity_dftest
+```
+
+research against variable sex
+```{r}
+sex_df <- dbGetQuery(db, "
+ SELECT 
+    financial_year AS year,
+    region, 
+    legislation,
+    outcome,
+    link,
+    sex,
+    SUM(CASE WHEN link IN ('Linked', 'Not linked', 'Unknown link') THEN 1.0 ELSE 0 END) / NULLIF(SUM(number_of_searches), 0) * 100 AS percentage_reasonable,
+
+    SUM(number_of_searches) AS number_of_searches
+FROM stop_search_mar21_mar23
+GROUP BY sex,year, link
+ORDER BY year")
+sex_df
+```
+
+
+```{r}
+sex_df <- dbGetQuery(db, "
+SELECT 
+    financial_year AS year,
+    region, 
+    legislation,
+    outcome,
+    sex,
+    SUM(CASE WHEN link IN ('Linked', 'Not linked', 'Unknown link') THEN 1.0 ELSE 0 END) / NULLIF(SUM(number_of_searches), 0) * 100 AS percentage_reasonable,
+    SUM(number_of_searches) AS number_of_searches
+FROM stop_search_mar21_mar23
+GROUP BY sex, year
+ORDER BY year")
+sex_df
+
+```
+
+```{r}
+sex_sum <- dbGetQuery(db, "
+ SELECT
+    sex,
+    SUM(ss.number_of_searches) AS total_number_of_searches,
+    SUM(ss.number_of_searches)/3 AS average_number_of_searches_per_year,
+    (SUM(ss.number_of_searches) * 1000.0) / 
+     (3* (SELECT SUM(REPLACE(psex.Population, ',', '') + 0)FROM population_by_age_sex_force_21cesnus psex 
+       WHERE psex.Sex = ss.sex) )AS searches_per_1000_population_per_year,
+    (SUM(ss.number_of_searches) * 100.0) / (SELECT SUM(number_of_searches) FROM stop_search_mar21_mar23 WHERE sex NOT IN ('Unknown', 'N/A - vehicle search') ) AS search_percentage,
+   ( SUM(CASE WHEN link IN ('Linked',  'Unknown link') THEN number_of_searches ELSE 0 END)*1.0) / NULLIF(SUM(ss.number_of_searches), 0) * 100 AS reasonable_search_percentage
+FROM stop_search_mar21_mar23 ss
+WHERE sex NOT IN ('Unknown', 'N/A - vehicle search') 
+GROUP BY sex
+")
+sex_sum
+```
+
+
+```{r}
+sex_df_year <- dbGetQuery(db, "
+ SELECT
+ financial_year,
+    sex,
+    SUM(ss.number_of_searches) AS number_of_searches,
+    
+    (SUM(ss.number_of_searches) * 1000.0) / 
+     (3* (SELECT SUM(REPLACE(psex.Population, ',', '') + 0)FROM population_by_age_sex_force_21cesnus psex 
+       WHERE psex.Sex = ss.sex) )AS searches_per_1000_population_per_year,
+       
+    (SUM(ss.number_of_searches) * 100.0) / (SELECT SUM(number_of_searches) FROM stop_search_mar21_mar23 WHERE sex NOT IN ('Unknown', 'N/A - vehicle search') ) AS search_percentage,
+    
+   ( SUM(CASE WHEN link IN ('Linked',  'Unknown link') THEN number_of_searches ELSE 0 END)*1.0) / NULLIF(SUM(ss.number_of_searches), 0) * 100 AS reasonable_search_percentage
+   
+FROM stop_search_mar21_mar23 ss
+WHERE sex NOT IN ('Unknown', 'N/A - vehicle search') 
+GROUP BY financial_year,sex
+")
+sex_df_year
+
+
+sex_df_year2 <- dbGetQuery(db, "
+ SELECT
+ financial_year,
+    sex,
+    SUM(ss.number_of_searches) AS number_of_searches,
+    
+    (SUM(ss.number_of_searches) * 1000.0) / 
+     (3* (SELECT SUM(REPLACE(psex.Population, ',', '') + 0)FROM ethnicity_age_sex_census_long psex 
+       WHERE psex.sex = ss.sex) )AS searches_per_1000_population_per_year,
+       
+    (SUM(ss.number_of_searches) * 100.0) / (SELECT SUM(number_of_searches) FROM stop_search_mar21_mar23 WHERE sex NOT IN ('Unknown', 'N/A - vehicle search') ) AS search_percentage,
+    
+   ( SUM(CASE WHEN link IN ('Linked',  'Unknown link') THEN number_of_searches ELSE 0 END)*1.0) / NULLIF(SUM(ss.number_of_searches), 0) * 100 AS reasonable_search_percentage
+   
+FROM stop_search_mar21_mar23 ss
+WHERE sex NOT IN ('Unknown', 'N/A - vehicle search') 
+GROUP BY financial_year,sex
+")
+sex_df_year2
+```
+```{r}
+sex_df_year <- dbGetQuery(db, "
+ SELECT
+ financial_year,
+ sex,
+ SUM(ss.number_of_searches) AS number_of_searches,
+ 
+ (SUM(ss.number_of_searches) * 1000.0) / 
+ (3* (SELECT SUM(REPLACE(psex.Population, ',', '') + 0) FROM ethnicity_age_sex_census_long psex  
+ WHERE psex.sex = ss.sex) )AS searches_per_1000_population_per_year,
+
+ (SUM(ss.number_of_searches) * 100.0) / 
+ (SELECT SUM(number_of_searches) 
+ FROM stop_search_mar21_mar23 
+ WHERE financial_year = ss.financial_year AND sex NOT IN ('Unknown', 'N/A - vehicle search')) AS search_percentage_per_year,
+
+ (SUM(CASE WHEN link IN ('Linked', 'Unknown link') THEN number_of_searches ELSE 0 END) * 100.0) / NULLIF(SUM(ss.number_of_searches), 0) AS reasonable_search_percentage
+
+FROM stop_search_mar21_mar23 ss
+WHERE sex NOT IN ('Unknown', 'N/A - vehicle search') 
+GROUP BY financial_year, sex
+")
+sex_df_year
+```
+
+
+```{r}
+pie_chart <- ggplot(sex_sum, aes(x = "", y = search_percentage, fill = sex)) +
+  geom_bar(stat = "identity", width = 1) +
+  coord_polar("y", start = 0) +
+  geom_text(aes(label = paste0(round(search_percentage, 2), "%")), 
+            position = position_stack(vjust = 0.5), 
+            color = "black", size = 3) +  # Reduced text size
+  theme_void() +
+ scale_fill_brewer(palette = "Set1", name = "Sex", labels = paste(sex_sum$sex, ": ", round(sex_sum$search_percentage, 2), "%")) +
+  theme(legend.title = element_blank(), legend.position = "bottom") +
+  labs(title = "Percentage of Searches by Sex",
+       subtitle = "from Financial Year 2020 to 2022")
+
+pie_chart
+
+
+
+```
+
+
+```{r}
+library(ggplot2)
+library(scales)
+# Filter out the "Other" category for displaying in the pie
+filtered_sex_sum <- sex_sum[sex_sum$sex != "Other", ]
+
+# Pie Chart for search_percentage with labels
+pie_chart <- ggplot(filtered_sex_sum, aes(x = "", y = search_percentage, fill = sex)) +
+  geom_bar(stat = "identity", width = 1) +
+  coord_polar("y", start = 0) +
+  geom_text(aes(label = ifelse(sex == "Other", "", paste0(round(search_percentage, 2), "%"))), 
+            position = position_stack(vjust = 0.5), 
+            color = "black", size = 3) +
+  theme_void() +
+  scale_fill_brewer(palette = "Set1", name = "Sex", 
+                    labels = paste(filtered_sex_sum$sex, ": ", round(filtered_sex_sum$search_percentage, 2), "%")) +
+  theme(legend.title = element_blank(), legend.position = "bottom") +
+  labs(title = "Percentage of Total Number of Searches by Sex",
+       subtitle = "from Financial Year 2020 to 2022")
+
+pie_chart
+
+
+# Define colors for each ethnicity
+base_colors <- c("Male" = "#1f77b4", 
+                 "Female" = "#d62728")
+
+# Create a named vector for alpha values to be used for the legend
+alpha_values <- c("Reasonable" = 1, "Non-Reasonable" = 0.45)
+
+# Create the bar chart
+bar_chart <- ggplot(filtered_sex_sum, aes(x = sex, y = total_number_of_searches, fill = sex)) +
+  geom_bar(stat = "identity", aes(alpha = "Non-Reasonable")) +
+  geom_bar(stat = "identity", 
+           aes(y = total_number_of_searches * reasonable_search_percentage / 100, alpha = "Reasonable")) +
+  geom_text(aes(y = total_number_of_searches * reasonable_search_percentage / 100, 
+                label = paste0(round(reasonable_search_percentage, 2), "%")), 
+            vjust = 1.5, 
+            color = "black") +
+  geom_text(aes(label = total_number_of_searches), 
+            position = position_stack(vjust = 1.1), 
+            color = "black") +
+  scale_y_continuous(labels = comma) +
+  scale_fill_manual(values = base_colors) +
+  scale_alpha_manual(values = alpha_values, 
+                     guide = guide_legend(title = "Search Type")) +
+  theme_minimal() +
+  labs(title = "Total Number of Stop and Searches by Sex from 2020 to 2023",
+        subtitle = "in financial year with outcome-linked searches percentage",
+       x = "Sex", y = "Total Number of Searches", fill = "Sex") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1, size = 8),
+        plot.subtitle = element_text(hjust = 0.5)) # Center-align the subtitle
+
+bar_chart
+
+
+```
+```{r}
+library(ggplot2)
+library(scales)  
+# Filter out the "Other" category for displaying in the pie
+filtered_sex_df_year <- sex_df_year[sex_sum$sex != "Other", ]
+
+# Plotting the bar chart
+ggplot(filtered_sex_df_year, aes(x = sex, y = searches_per_1000_population_per_year, fill = financial_year)) +
+  geom_bar(stat = "identity", position = "dodge") +
+  geom_text(
+    aes(label = paste0(round(searches_per_1000_population_per_year,2))),  # Format as integer
+    vjust = -0.3, 
+    position = position_dodge(width = 0.9), 
+    color = "black", 
+    size = 3  # Adjust the text size here
+  ) +
+  scale_y_continuous(labels = scales::comma) +  # Use comma formatting for y-axis
+  labs(x = "Sex Group", y = "Number of Searches per 1000 Population", title = "Number of Searches per 1000 Population by Sex",
+       subtitle = "from Financial Year 2020 to 2022 using 2021 Census Data") +
+  theme_minimal() +
+  theme(
+    legend.title = element_blank(), 
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    plot.title = element_text(hjust = 0.5),   # Center-align the title
+    plot.subtitle = element_text(hjust = 0.5) # Center-align the subtitle
+  )
+
+# Display the plot
+print(sex_df_year)
+
+```
+
+```{r}
+library(ggplot2)
+library(scales)  # For formatting the y-axis labels
+
+
+
+# Calculate the non-reasonable searches
+filtered_sex_df_year$non_reasonable_searches <- filtered_sex_df_year$number_of_searches - (filtered_sex_df_year$number_of_searches * filtered_sex_df_year$reasonable_search_percentage / 100)
+
+# Define alpha values for reasonable and non-reasonable searches
+alpha_values <- c("Reasonable" = 1, "Non-Reasonable" = 0.5)  # Adjust non-reasonable alpha here
+
+# Plotting the bar chart
+ggplot(filtered_sex_df_year, aes(x = sex, fill = financial_year)) +
+  # Reasonable searches
+  geom_bar(aes(y = number_of_searches * reasonable_search_percentage / 100, alpha = "Reasonable"), stat = "identity", position = "dodge") +
+  # Non-reasonable searches (adjusted alpha value for better visibility)
+  geom_bar(aes(y = non_reasonable_searches, alpha = "Non-Reasonable"), stat = "identity", position = "dodge") +
+  # Labels for total number of searches
+  geom_text(
+    aes(y = number_of_searches, label = number_of_searches), 
+    vjust = -0.3, 
+    position = position_dodge(width = 0.9), 
+    color = "black", 
+    size = 3
+  ) +
+  # Labels for percentage of reasonable searches
+  geom_text(
+    aes(y = number_of_searches * reasonable_search_percentage / 100, label = paste0(round(reasonable_search_percentage, 2), "%")), 
+    vjust = -0.5, 
+    position = position_dodge(width = 0.9), 
+    color = "black", 
+    size = 2.5
+  ) +
+  scale_y_continuous(labels = scales::comma) +
+  scale_alpha_manual(values = alpha_values, guide = guide_legend(title = "Search Type")) +
+  labs(x = "Ethnic Group", y = "Number of Searches", title = "Number of Stop and Searches by Ethnicity from Financial Year 2020 to 2022") +
+  theme_minimal() +
+  theme(
+    legend.title = element_blank(), 
+    axis.text.x = element_text(angle = 45, hjust = 1)
+  )
+
+# Display the plot
+print(sex_df_year)
+
+```
+
+## research against variable ethnicity
+
+```{r}
+ethnicity_dftest <- dbGetQuery(db, "
+    SELECT 
+    financial_year AS year,
+    combined_ethnicity as ethnicity,
+    SUM(number_of_searches) AS number_of_searches
+FROM stop_search_mar21_mar23
+GROUP BY ethnicity,year
+ORDER BY year")
+ethnicity_dftest
+```
+
+
+```{r}
+ethnicity_df <- dbGetQuery(db, "
+   SELECT 
+    financial_year AS year,
+    region, 
+    legislation,
+    outcome,
+    link,
+    combined_ethnicity as ethnicity,
+    SUM(CASE WHEN link IN ('Linked', 'Not linked', 'Unknown link') THEN 1.0 ELSE 0 END) / NULLIF(SUM(number_of_searches), 0) * 100 AS percentage_reasonable,
+    SUM(number_of_searches) AS number_of_searches
+FROM stop_search_mar21_mar23
+GROUP BY ethnicity,year, link
+ORDER BY year")
+ethnicity_df
+```
+
+```{r}
+ethnicity_df <- dbGetQuery(db, "
+ SELECT 
+    financial_year AS year,
+    region, 
+    legislation,
+    outcome,
+    combined_ethnicity as ethnicity,
+    SUM(CASE WHEN link IN ('Linked', 'Not linked', 'Unknown link') THEN 1.0 ELSE 0 END) / NULLIF(SUM(number_of_searches), 0) * 100 AS percentage_reasonable,
+    SUM(number_of_searches) AS number_of_searches
+FROM stop_search_mar21_mar23
+GROUP BY ethnicity, year
+ORDER BY year")
+ethnicity_df
+
+```
+
+```{r}
+ethnicity_df_year <- dbGetQuery(db, "
+ SELECT 
+ financial_year,
+    combined_ethnicity as ethnicity,
+    
+    SUM(ss.number_of_searches) AS number_of_searches,
+    
+    SUM(ss.number_of_searches)/3 AS average_number_of_searches,
+    
+    (SUM(ss.number_of_searches) * 1000.0) / 
+     ((SELECT SUM(REPLACE(p.Population, ',', '') + 0)FROM population_by_force_by_ethic_21census p 
+       WHERE p.combinedethnicity = ss.combined_ethnicity) )AS searches_per_1000_population_per_year,
+       
+    (SUM(ss.number_of_searches) * 100.0) / (SELECT SUM(number_of_searches) FROM stop_search_mar21_mar23 WHERE financial_year = ss.financial_year AND combined_ethnicity NOT IN ('Unknown', 'N/A - vehicle search') ) AS search_percentage,
+    
+    ( SUM(CASE WHEN link IN ('Linked',  'Unknown link') THEN number_of_searches ELSE 0 END)*1.0) / NULLIF(SUM(ss.number_of_searches), 0) * 100 AS percentage_reasonable
+    
+FROM stop_search_mar21_mar23 ss
+WHERE combined_ethnicity NOT IN ('Unknown', 'N/A - vehicle search')
+GROUP BY financial_year,combined_ethnicity
+")
+ethnicity_df_year
+
+ethnicity_df <- dbGetQuery(db, "
+ SELECT 
+    combined_ethnicity as ethnicity,
+    SUM(ss.number_of_searches) AS number_of_searches,
+    
+    (SUM(ss.number_of_searches) * 1000.0) / 
+     (3*(SELECT SUM(REPLACE(p.Population, ',', '') + 0)FROM population_by_force_by_ethic_21census p 
+       WHERE p.combinedethnicity = ss.combined_ethnicity) )AS searches_per_1000_population_per_year,
+    (SUM(ss.number_of_searches) * 100.0) / (SELECT SUM(number_of_searches) FROM stop_search_mar21_mar23 WHERE combined_ethnicity NOT IN ('Unknown', 'N/A - vehicle search') ) AS search_percentage,
+    ( SUM(CASE WHEN link IN ('Linked',  'Unknown link') THEN number_of_searches ELSE 0 END)*1.0) / NULLIF(SUM(ss.number_of_searches), 0) * 100 AS percentage_reasonable
+FROM stop_search_mar21_mar23 ss
+WHERE combined_ethnicity NOT IN ('Unknown', 'N/A - vehicle search')
+GROUP BY combined_ethnicity
+")
+ethnicity_df
+
+
+```
+
+```{r}
+library(ggplot2)
+library(scales)
+
+
+# Pie Chart for search_percentage with labels
+pie_chart <- ggplot(ethnicity_df, aes(x = "", y = search_percentage, fill = ethnicity)) +
+  geom_bar(stat = "identity", width = 1) +
+  coord_polar("y", start = 0) +
+  geom_text(aes(label = paste0(round(search_percentage, 1), "%")), 
+            position = position_stack(vjust = 0.5), 
+            color = "black") +
+  theme_void() +
+  scale_fill_brewer(palette = "Set1") +
+  theme(legend.title = element_blank()) +
+  labs(fill = "Ethnicity", title = "Percentage of Searches by Ethnicity ",subtitle = "from Financial Year 2020 to 2022")
+
+pie_chart
+
+
+# Define colors for each ethnicity
+base_colors <- c("Asian or Asian British" = "#1f77b4", 
+                 "Black or Black British" = "#ff7f0e", 
+                 "Mixed or Other" = "#2ca02c", 
+                 "White" = "#d62728")
+
+# Create a named vector for alpha values to be used for the legend
+alpha_values <- c("Reasonable" = 1, "Non-Reasonable" = 0.45)
+
+# Create the bar chart
+bar_chart <- ggplot(ethnicity_df, aes(x = ethnicity, y = number_of_searches, fill = ethnicity)) +
+  geom_bar(stat = "identity", aes(alpha = "Non-Reasonable")) +
+  geom_bar(stat = "identity", 
+           aes(y = number_of_searches * percentage_reasonable / 100, alpha = "Reasonable")) +
+  geom_text(aes(y = number_of_searches * percentage_reasonable / 100, 
+                label = paste0(round(percentage_reasonable, 2), "%")), 
+            vjust = 1.5, 
+            color = "black") +
+  geom_text(aes(label = number_of_searches), 
+            position = position_stack(vjust = 1.1), 
+            color = "black") +
+  scale_y_continuous(labels = comma) +
+  scale_fill_manual(values = base_colors) +
+  scale_alpha_manual(values = alpha_values, 
+                     guide = guide_legend(title = "Search Type")) +
+  theme_minimal() +
+  labs(title = "Total Number of Stop and Searches by Ethnicity from 2020 to 2023",
+        subtitle = "in financial year with outcome-linked searches percentage",
+       x = "Ethnicity", y = "Number of Searches", fill = "Ethnicity") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1, size = 8),
+        plot.subtitle = element_text(hjust = 0.5)) # Center-align the subtitle
+
+bar_chart
+
+```
+
+
+```{r}
+library(ggplot2)
+library(scales)  # For formatting the y-axis labels
+
+
+
+# Plotting the bar chart
+ggplot(ethnicity_df_year, aes(x = ethnicity, y = searches_per_1000_population_per_year, fill = financial_year)) +
+  geom_bar(stat = "identity", position = "dodge") +
+  geom_text(
+    aes(label = as.integer(searches_per_1000_population_per_year)),  # Format as integer
+    vjust = -0.3, 
+    position = position_dodge(width = 0.9), 
+    color = "black", 
+    size = 3  # Adjust the text size here
+  ) +
+  scale_y_continuous(labels = scales::comma) +  # Use comma formatting for y-axis
+  labs(x = "Ethnic Group", y = "Number of Searches per 1000 Population", title = "Number of Searches per 1000 Population by Ethnicity",
+       subtitle = "from Financial Year 2020 to 2022 using 2021 Census Data") +
+  theme_minimal() +
+  theme(
+    legend.title = element_blank(), 
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    plot.title = element_text(hjust = 0.5),   # Center-align the title
+    plot.subtitle = element_text(hjust = 0.5) # Center-align the subtitle
+  )
+
+# Display the plot
+print(ethnicity_df_year)
+
+```
+
+```{r}
+library(ggplot2)
+library(scales)  # For formatting the y-axis labels
+
+
+# Calculate the non-reasonable searches
+ethnicity_df_year$non_reasonable_searches <- ethnicity_df_year$number_of_searches - (ethnicity_df_year$number_of_searches * ethnicity_df_year$percentage_reasonable / 100)
+
+# Define alpha values for reasonable and non-reasonable searches
+alpha_values <- c("Reasonable" = 1, "Non-Reasonable" = 0.5)  # Adjust non-reasonable alpha here
+
+# Plotting the bar chart
+ggplot(ethnicity_df_year, aes(x = ethnicity, fill = financial_year)) +
+  # Reasonable searches
+  geom_bar(aes(y = number_of_searches * percentage_reasonable / 100, alpha = "Reasonable"), stat = "identity", position = "dodge") +
+  # Non-reasonable searches (adjusted alpha value for better visibility)
+  geom_bar(aes(y = non_reasonable_searches, alpha = "Non-Reasonable"), stat = "identity", position = "dodge") +
+  # Labels for total number of searches
+  geom_text(
+    aes(y = number_of_searches, label = number_of_searches), 
+    vjust = -0.3, 
+    position = position_dodge(width = 0.9), 
+    color = "black", 
+    size = 3
+  ) +
+  # Labels for percentage of reasonable searches
+  geom_text(
+    aes(y = number_of_searches * percentage_reasonable / 100, label = paste0(round(percentage_reasonable, 2), "%")), 
+    vjust = -0.5, 
+    position = position_dodge(width = 0.9), 
+    color = "black", 
+    size = 2.5
+  ) +
+  scale_y_continuous(labels = scales::comma) +
+  scale_alpha_manual(values = alpha_values, guide = guide_legend(title = "Search Type")) +
+  labs(x = "Ethnic Group", y = "Number of Searches", title = "Number of Stop and Searches by Ethnicity from Financial Year 2020 to 2022") +
+  theme_minimal() +
+  theme(
+    legend.title = element_blank(), 
+    axis.text.x = element_text(angle = 45, hjust = 1)
+  )
+
+
+
+```
+
+## research against variable age
+
+```{r}
+age_df <- dbGetQuery(db, "
+ SELECT 
+    financial_year AS year,
+    region, 
+    legislation,
+    outcome,
+    link,
+    age_group,
+    SUM(CASE WHEN link IN ('Linked', 'Not linked', 'Unknown link') THEN 1.0 ELSE 0 END) / NULLIF(SUM(number_of_searches), 0) * 100 AS percentage_reasonable,
+    SUM(number_of_searches) AS number_of_searches
+FROM stop_search_mar21_mar23
+GROUP BY age_group,year, link
+ORDER BY year")
+age_df
+```
+
+```{r}
+age_df <- dbGetQuery(db, "
+ SELECT 
+    financial_year AS year,
+    region, 
+    legislation,
+    outcome,
+    age_group,
+    SUM(CASE WHEN link IN ('Linked', 'Not linked', 'Unknown link') THEN 1.0 ELSE 0 END) / NULLIF(SUM(number_of_searches), 0) * 100 AS percentage_reasonable,
+    SUM(number_of_searches) AS number_of_searches
+FROM stop_search_mar21_mar23
+GROUP BY age_group, year
+ORDER BY year")
+age_df
+
+```
+
+```{r}
+
+age_sum <- dbGetQuery(db, "
+ SELECT 
+    age_group,
+    SUM(ss.number_of_searches) AS number_of_searches,
+    
+    SUM(ss.number_of_searches)/3 AS average_number_of_searches,
+    
+    (SUM(ss.number_of_searches) * 1000.0) / 
+     (3* (SELECT SUM(REPLACE(psex.Population, ',', '') + 0)FROM population_by_age_sex_force_21cesnus psex 
+       WHERE psex.New_Age_Group = ss.age_group) )AS searches_per_1000_population,
+       
+    (SUM(ss.number_of_searches) * 100.0) / (SELECT SUM(number_of_searches) FROM stop_search_mar21_mar23 WHERE age_group NOT IN ('Unknown', 'N/A - vehicle search') ) AS search_percentage,
+    
+    SUM(CASE WHEN link IN ('Linked', 'Not linked', 'Unknown link') THEN 1.0 ELSE 0 END) / NULLIF(SUM(ss.number_of_searches), 0) * 100 AS percentage_reasonable
+    
+FROM stop_search_mar21_mar23 ss
+WHERE age_group NOT IN ('Unknown', 'N/A - vehicle search') 
+GROUP BY age_group
+")
+age_sum
+
+
+
+age_df_year <- dbGetQuery(db, "
+ SELECT 
+    financial_year,
+    age_group,
+    SUM(ss.number_of_searches) AS number_of_searches,
+    
+    (SUM(ss.number_of_searches) * 1000.0) / 
+     ((SELECT SUM(REPLACE(psex.Population, ',', '') + 0)FROM population_by_age_sex_force_21cesnus psex 
+       WHERE psex.New_Age_Group = ss.age_group) )AS searches_per_1000_population_per_year,
+       
+    (SUM(ss.number_of_searches) * 100.0) / (SELECT SUM(number_of_searches) FROM stop_search_mar21_mar23 WHERE financial_year = ss.financial_year AND age_group NOT IN ('Unknown', 'N/A - vehicle search') ) AS search_percentage,
+    
+    SUM(CASE WHEN link IN ('Linked', 'Not linked', 'Unknown link') THEN 1.0 ELSE 0 END) / NULLIF(SUM(ss.number_of_searches), 0) * 100 AS percentage_reasonable
+    
+FROM stop_search_mar21_mar23 ss
+WHERE age_group NOT IN ('Unknown', 'N/A - vehicle search') 
+GROUP BY financial_year,age_group
+")
+age_df_year
+
+
+age_sum <- dbGetQuery(db, "
+ SELECT 
+    age_group,
+    SUM(ss.number_of_searches) AS number_of_searches,
+    
+    SUM(ss.number_of_searches)/3 AS average_number_of_searches,
+    
+    (SUM(ss.number_of_searches) * 1000.0) / 
+     (3* (SELECT SUM(REPLACE(psex.Population, ',', '') + 0)FROM ethnicity_age_sex_census_long psex 
+       WHERE psex.Age_Group = ss.age_group) )AS searches_per_1000_population,
+       
+    (SUM(ss.number_of_searches) * 100.0) / (SELECT SUM(number_of_searches) FROM stop_search_mar21_mar23 WHERE age_group NOT IN ('Unknown', 'N/A - vehicle search') ) AS search_percentage,
+    
+    SUM(CASE WHEN link IN ('Linked', 'Not linked', 'Unknown link') THEN 1.0 ELSE 0 END) / NULLIF(SUM(ss.number_of_searches), 0) * 100 AS percentage_reasonable
+    
+FROM stop_search_mar21_mar23 ss
+WHERE age_group NOT IN ('Unknown', 'N/A - vehicle search') 
+GROUP BY age_group
+")
+age_sum
+
+
+
+age_df_year <- dbGetQuery(db, "
+ SELECT 
+    financial_year,
+    age_group,
+    SUM(ss.number_of_searches) AS number_of_searches,
+    
+    (SUM(ss.number_of_searches) * 1000.0) / 
+     ((SELECT SUM(REPLACE(psex.Population, ',', '') + 0)FROM ethnicity_age_sex_census_long psex 
+       WHERE psex.Age_Group = ss.age_group) )AS searches_per_1000_population_per_year,
+       
+    (SUM(ss.number_of_searches) * 100.0) / (SELECT SUM(number_of_searches) FROM stop_search_mar21_mar23 WHERE financial_year = ss.financial_year AND age_group NOT IN ('Unknown', 'N/A - vehicle search') ) AS search_percentage,
+    
+    SUM(CASE WHEN link IN ('Linked', 'Not linked', 'Unknown link') THEN 1.0 ELSE 0 END) / NULLIF(SUM(ss.number_of_searches), 0) * 100 AS percentage_reasonable
+    
+FROM stop_search_mar21_mar23 ss
+WHERE age_group NOT IN ('Unknown', 'N/A - vehicle search') 
+GROUP BY financial_year,age_group
+")
+age_df_year
+```
+
+```{r}
+library(ggplot2)
+library(scales)
+# Pie Chart for search_percentage with labels
+pie_chart <- ggplot(age_sum, aes(x = "", y = search_percentage, fill = age_group)) +
+  geom_bar(stat = "identity", width = 1) +
+  coord_polar("y", start = 0) +
+  geom_text(aes(label = paste0(round(search_percentage, 2), "%")), 
+            position = position_stack(vjust = 0.5), 
+            color = "black") +
+  theme_void() +
+  scale_fill_brewer(palette = "Set1") +
+  theme(legend.title = element_blank()) +
+  labs(fill = "Age", title = "Percentage of Searches by Age ",subtitle = "from Financial Year 2020 to 2022")
+
+pie_chart
+
+
+
+# Define colors for each ethnicity
+base_colors <- c("10-17" = "#1f77b4", 
+                 "18-24" = "#ff7f0e", 
+                 "25-29" = "#2ca02c", 
+                 "30 or over" = "#d62728",
+"Under 10"="purple")
+
+# Create a named vector for alpha values to be used for the legend
+alpha_values <- c("Reasonable" = 1, "Non-Reasonable" = 0.45)
+
+# Create the bar chart
+bar_chart <- ggplot(age_sum, aes(x = age_group, y = number_of_searches, fill = age_group)) +
+  geom_bar(stat = "identity", aes(alpha = "Non-Reasonable")) +
+  geom_bar(stat = "identity", 
+           aes(y = number_of_searches * percentage_reasonable / 100, alpha = "Reasonable")) +
+  geom_text(aes(y = number_of_searches * percentage_reasonable / 100, 
+                label = paste0(round(percentage_reasonable, 2), "%")), 
+            vjust = 1.5, 
+            color = "black") +
+  geom_text(aes(label = number_of_searches), 
+            position = position_stack(vjust = 1.1), 
+            color = "black") +
+  scale_y_continuous(labels = comma) +
+  scale_fill_manual(values = base_colors) +
+  scale_alpha_manual(values = alpha_values, 
+                     guide = guide_legend(title = "Search Type")) +
+  theme_minimal() +
+  labs(title = "Total Number of Stop and Searches by Age from 2020 to 2023",
+        subtitle = "in financial year with outcome-linked searches percentage",
+       x = "Age", y = "Number of Searches", fill = "Age") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1, size = 8),
+        plot.subtitle = element_text(hjust = 0.5)) # Center-align the subtitle
+
+bar_chart
+
+```
+
+```{r}
+library(ggplot2)
+library(scales)  # For formatting the y-axis labels
+
+# Plotting the bar chart
+ggplot(age_df_year, aes(x = age_group, y = searches_per_1000_population_per_year, fill = financial_year)) +
+  geom_bar(stat = "identity", position = "dodge") +
+  geom_text(
+    aes(label = as.integer(searches_per_1000_population_per_year)),  # Format as integer
+    vjust = -0.3, 
+    position = position_dodge(width = 0.9), 
+    color = "black", 
+    size = 3  # Adjust the text size here
+  ) +
+  scale_y_continuous(labels = scales::comma) +  # Use comma formatting for y-axis
+  labs(x = "Age Group", y = "Number of Searches per 1000 Population", title = "Number of Searches per 1000 Population by Ethnicity",
+       subtitle = "from Financial Year 2020 to 2022 using 2021 Census Data") +
+  theme_minimal() +
+  theme(
+    legend.title = element_blank(), 
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    plot.title = element_text(hjust = 0.5),   # Center-align the title
+    plot.subtitle = element_text(hjust = 0.5) # Center-align the subtitle
+  )
+
+# Display the plot
+print(age_df_year)
+
+```
+
+
+```{r}
+library(ggplot2)
+library(scales)  # For formatting the y-axis labels
+
+age_df_year$non_reasonable_searches <- age_df_year$number_of_searches - (age_df_year$number_of_searches * age_df_year$percentage_reasonable / 100)
+
+# Define alpha values for reasonable and non-reasonable searches
+alpha_values <- c("Reasonable" = 1, "Non-Reasonable" = 0.5)  # Adjust non-reasonable alpha here
+
+# Plotting the bar chart
+ggplot(age_df_year, aes(x = age_group, fill = financial_year)) +
+  # Reasonable searches
+  geom_bar(aes(y = number_of_searches * percentage_reasonable / 100, alpha = "Reasonable"), stat = "identity", position = "dodge") +
+  # Non-reasonable searches (adjusted alpha value for better visibility)
+  geom_bar(aes(y = non_reasonable_searches, alpha = "Non-Reasonable"), stat = "identity", position = "dodge") +
+  # Labels for total number of searches
+  geom_text(
+    aes(y = number_of_searches, label = number_of_searches), 
+    vjust = -0.3, 
+    position = position_dodge(width = 0.9), 
+    color = "black", 
+    size = 3
+  ) +
+  # Labels for percentage of reasonable searches
+  geom_text(
+    aes(y = number_of_searches * percentage_reasonable / 100, label = paste0(round(percentage_reasonable, 2), "%")), 
+    vjust = -0.5, 
+    position = position_dodge(width = 0.9), 
+    color = "black", 
+    size = 2.5
+  ) +
+  scale_y_continuous(labels = scales::comma) +
+  scale_alpha_manual(values = alpha_values, guide = guide_legend(title = "Search Type")) +
+  labs(x = "Ethnic Group", y = "Number of Searches", title = "Number of Stop and Searches by Ethnicity from Financial Year 2020 to 2022") +
+  theme_minimal() +
+  theme(
+    legend.title = element_blank(), 
+    axis.text.x = element_text(angle = 45, hjust = 1)
+  )
+
+# Display the plot
+print(age_df_year)
+
+```
+
+## research based on ethnicity and sex 
+
+
+```{r}
+ethnicity_sex<- dbGetQuery(db, "
+ SELECT Age_Group,
+ ethnicity_group, 
+ SUM(Population) AS Populatoin
+ FROM ethnicity_age_sex_census_long psex 
+ GROUP BY Age_Group, ethnicity_group
+")
+ ethnicity_sex
+ 
+ 
+ethnicity_sex_sum <- dbGetQuery(db, "
+ SELECT 
+    age_group,
+    combined_ethnicity,
+    SUM(ss.number_of_searches) AS number_of_searches,
+    
+    SUM(ss.number_of_searches)/3 AS average_number_of_searches,
+    
+    (SUM(ss.number_of_searches) * 1000.0) / 
+     (3* (SELECT SUM(REPLACE(psex.Population, ',', '') + 0)FROM ethnicity_age_sex_census_long psex 
+       WHERE psex.Age_Group = ss.age_group AND psex.ethnicity_group = ss.combined_ethnicity) )AS searches_per_1000_population,
+       
+       
+    (SUM(ss.number_of_searches) * 100.0) / (SELECT SUM(number_of_searches) FROM stop_search_mar21_mar23 WHERE age_group NOT IN ('Unknown', 'N/A - vehicle search') ) AS search_percentage,
+    
+    SUM(CASE WHEN link IN ('Linked', 'Not linked', 'Unknown link') THEN 1.0 ELSE 0 END) / NULLIF(SUM(ss.number_of_searches), 0) * 100 AS percentage_reasonable
+    
+FROM stop_search_mar21_mar23 ss
+WHERE age_group NOT IN ('Unknown', 'N/A - vehicle search') AND combined_ethnicity != 'Unknown'
+GROUP BY age_group,combined_ethnicity
+")
+
+ethnicity_sex_sum$searches_per_1000_population <- format(ethnicity_sex_sum$searches_per_1000_population, scientific = FALSE)
+ethnicity_sex_sum$search_percentage <- format(ethnicity_sex_sum$search_percentage, scientific = FALSE)
+
+ethnicity_sex_sum
+```
+
+
+```{r}
+ethnicity_sex_df_year <- dbGetQuery(db, "
+ SELECT 
+    financial_year,
+    age_group,
+    combined_ethnicity,
+    SUM(ss.number_of_searches) AS number_of_searches,
+    
+    (SUM(ss.number_of_searches) * 1000.0) / 
+     ((SELECT SUM(REPLACE(psex.Population, ',', '') + 0)FROM ethnicity_age_sex_census_long psex 
+       WHERE psex.Age_Group = ss.age_group) )AS searches_per_1000_population_per_year,
+       
+    (SUM(ss.number_of_searches) * 100.0) / (SELECT SUM(number_of_searches) FROM stop_search_mar21_mar23 WHERE financial_year = ss.financial_year AND age_group NOT IN ('Unknown', 'N/A - vehicle search') ) AS search_percentage,
+    
+    SUM(CASE WHEN link IN ('Linked', 'Not linked', 'Unknown link') THEN 1.0 ELSE 0 END) / NULLIF(SUM(ss.number_of_searches), 0) * 100 AS percentage_reasonable
+    
+FROM stop_search_mar21_mar23 ss
+WHERE age_group NOT IN ('Unknown', 'N/A - vehicle search') 
+GROUP BY financial_year,age_group,combined_ethnicity
+")
+ethnicity_sex_df_year
+```
+
+```{r}
+library(ggplot2)
+
+ethnicity_sex_sum$searches_per_1000_population <- as.numeric(ethnicity_sex_sum$searches_per_1000_population)
+
+# If there are no non-numeric characters, you can convert directly to numeric
+# age_sex_sum$searches_per_1000_population <- as.numeric(age_sex_sum$searches_per_1000_population)
+
+# Now round and convert to integer
+ethnicity_sex_sum$searches_per_1000_population <- as.integer(round(ethnicity_sex_sum$searches_per_1000_population))
+
+my_colors <- c("#E69F00", "#56B4E9", "#009E73", "#F0E442", "#0072B2", "#D55E00", "#CC79A7")
+# Plotting the bar chart
+ggplot(ethnicity_sex_sum, aes(x = age_group, y = average_number_of_searches, fill = combined_ethnicity)) +
+  geom_bar(stat = "identity", position = "dodge", alpha = 1) +
+  scale_fill_manual(values = my_colors) + 
+  scale_y_continuous(labels = label_number(big.mark = ",")) +  # This will format numbers with commas
+  labs(
+    title = "Average Number of Searches by Age Group and Ethnicity ",
+    subtitle = "from financial year 2020 to 2022",
+    x = "Age Group",
+    y = "Average Number of Searches"
+  ) +
+  theme_minimal()
+
+
+# Plotting the bar chart
+ggplot(ethnicity_sex_sum, aes(x = age_group, y = searches_per_1000_population, fill = combined_ethnicity)) +
+  geom_bar(stat = "identity", position = "dodge", alpha = 1) +
+  scale_fill_manual(values = my_colors) + 
+  scale_y_continuous(labels = label_number(big.mark = ",")) +  # This will format numbers with commas
+  labs(
+    title = "Searches per 1000 Population by Age Group and Ethnicity",
+    subtitle = "from financial year 2020 to 2022",
+    x = "Age Group",
+    y = "Searches per 1000 Population"
+  ) +
+  theme_minimal()
+```
+## research based on age and sex
+
+```{r}
+age_sex<- dbGetQuery(db, "
+ SELECT Age_Group,
+ sex, 
+ SUM(Population) AS Populatoin
+ FROM ethnicity_age_sex_census_long psex 
+ GROUP BY Age_Group, sex
+")
+age_sex
+ 
+ge_sex<- dbGetQuery(db, "
+ SELECT age_group,
+ sex, 
+ SUM(number_of_searches) AS number_of_searches
+ FROM stop_search_mar21_mar23 
+ GROUP BY age_group, sex
+")
+ge_sex
+
+
+ 
+age_sex_sum <- dbGetQuery(db, "
+ SELECT 
+    age_group,
+    sex,
+    SUM(ss.number_of_searches) AS number_of_searches,
+    
+    SUM(ss.number_of_searches)/3 AS average_number_of_searches,
+    
+    (SUM(ss.number_of_searches) * 1000.0) / 
+     (3* (SELECT SUM(REPLACE(psex.Population, ',', '') + 0)FROM ethnicity_age_sex_census_long psex 
+       WHERE psex.Age_Group = ss.age_group AND psex.sex = ss.sex) )AS searches_per_1000_population,
+       
+       (SELECT SUM(REPLACE(psex.Population, ',', '') + 0) 
+     FROM ethnicity_age_sex_census_long psex 
+     WHERE psex.Age_Group = ss.age_group AND psex.sex = ss.sex) / 
+    (SELECT SUM(REPLACE(psex.Population, ',', '') + 0) 
+     FROM ethnicity_age_sex_census_long psex) * 100 AS population_percentage,
+       
+    (SUM(ss.number_of_searches) * 100.0) / (SELECT SUM(number_of_searches) FROM stop_search_mar21_mar23 WHERE age_group NOT IN ('Unknown', 'N/A - vehicle search') ) AS search_percentage,
+    
+    SUM(CASE WHEN link IN ('Linked', 'Not linked', 'Unknown link') THEN 1.0 ELSE 0 END) / NULLIF(SUM(ss.number_of_searches), 0) * 100 AS percentage_reasonable
+    
+FROM stop_search_mar21_mar23 ss
+WHERE age_group NOT IN ('Unknown', 'N/A - vehicle search')  AND sex NOT IN ('Other', 'Unknown')
+GROUP BY age_group,sex
+")
+
+age_sex_sum$searches_per_1000_population <- format(age_sex_sum$searches_per_1000_population, scientific = FALSE)
+age_sex_sum$search_percentage <- format(age_sex_sum$search_percentage, scientific = FALSE)
+
+age_sex_sum
+```
+final_plot
+```{r}
+age_sex_sum <- dbGetQuery(db, "
+SELECT 
+    age_group,
+    sex,
+    SUM(ss.number_of_searches) AS number_of_searches,
+    SUM(ss.number_of_searches)/3 AS average_number_of_searches,
+    
+    (SUM(ss.number_of_searches) * 1000.0) / 
+     (3* CAST((SELECT SUM(CAST(REPLACE(psex.Population, ',', '') AS FLOAT)) 
+          FROM ethnicity_age_sex_census_long psex 
+          WHERE psex.Age_Group = ss.age_group AND psex.sex = ss.sex) AS FLOAT)) AS searches_per_1000_population,
+           
+           CAST((SELECT SUM(CAST(REPLACE(psex.Population, ',', '') AS FLOAT)) 
+     FROM ethnicity_age_sex_census_long psex 
+     WHERE psex.Age_Group = ss.age_group AND psex.sex = ss.sex) AS FLOAT) / 
+    CAST((SELECT SUM(CAST(REPLACE(psex.Population, ',', '') AS FLOAT)) 
+     FROM ethnicity_age_sex_census_long psex) AS FLOAT) * 100 AS population_percentage,
+          
+    (SUM(ss.number_of_searches) * 100.0) / 
+    CAST((SELECT SUM(number_of_searches) FROM stop_search_mar21_mar23 
+     WHERE age_group NOT IN ('Unknown', 'N/A - vehicle search') 
+       AND sex NOT IN ('Other', 'Unknown')) AS FLOAT) AS search_percentage,
+       
+    SUM(CASE WHEN link IN ('Linked', 'Not linked', 'Unknown link') THEN 1.0 ELSE 0 END) / 
+    NULLIF(SUM(ss.number_of_searches), 0) * 100 AS percentage_reasonable
+   
+ FROM stop_search_mar21_mar23 ss
+ WHERE age_group NOT IN ('Unknown', 'N/A - vehicle search') 
+   AND sex NOT IN ('Other', 'Unknown')
+ GROUP BY age_group,sex
+ ")
+age_sex_sum
+```
+
+
+
+```{r}
+library(ggplot2)
+library(dplyr)
+
+
+
+# First, transform the data to long format for ggplot2
+age_sex_sum_long <- age_sex_sum %>%
+  gather(key = "metric", value = "percentage", population_percentage, search_percentage) %>%
+  mutate(direction = ifelse(metric == "population_percentage", -1, 1),
+         percentage = percentage * direction)
+```
+
+
+```{r}
+age_sex_sum_long <- age_sex_sum %>%
+select(age_group, sex, population_percentage, search_percentage) %>%
+  pivot_longer(cols = c(population_percentage, search_percentage),
+               names_to = "metric", values_to = "percentage") %>%
+  mutate(percentage = if_else(metric == "population_percentage", -percentage, percentage))
+```
+
+
+```{r}
+library(ggplot2)
+library(dplyr)
+library(tidyr)
+
+
+# Convert the data to long format
+df_long <- age_sex_sum %>%
+  pivot_longer(cols = c(population_percentage, search_percentage),
+               names_to = "metric", values_to = "percentage") %>%
+  mutate(percentage = if_else(metric == "population_percentage", -percentage, percentage),
+         metric = factor(metric, levels = c("population_percentage", "search_percentage"))) %>%
+  unite("metric_sex", metric, sex, sep = "_") # Combine metric and sex into one column
+
+# Define the width for dodging
+dodge_width <- 0.9
+
+# Plot
+ggplot(df_long, aes(x = age_group, y = percentage, fill = metric_sex)) +
+  geom_bar(stat = "identity", position = position_dodge(width = dodge_width)) +
+  coord_flip() + 
+  scale_y_continuous(labels = abs, 
+                     breaks = seq(-100, 100, by = 10), 
+                     limits = c(-max(abs(df_long$percentage)), max(abs(df_long$percentage)))) +
+  scale_fill_manual(values = c("population_percentage_Female" = "red", 
+                               "population_percentage_Male" = "blue",
+                               "search_percentage_Female" = "lightpink",
+                               "search_percentage_Male" = "lightblue")) +
+  labs(title = "Average Searches Percentage versus Population Percentage by Age Goup and Gender",
+    subtitle = "from year 2021 to 2023 based on 2021 Census",x = "Age Group", y = "Percentage", fill = "Group") +
+  theme_minimal() +
+  theme(legend.position = "bottom")
+
+# Note: Adjust the color values and breaks as per your preference
+
+```
+
+
+
+
+## research based on location( police_force_area)
+
+
+```{r}
+force_df <- dbGetQuery(db, "
+ SELECT 
+    financial_year AS year,
+    region, 
+    outcome,
+    link,
+    police_force_area,
+    SUM(CASE WHEN link IN ('Linked', 'Not linked', 'Unknown link') THEN 1.0 ELSE 0 END) / NULLIF(SUM(number_of_searches), 0) * 100 AS percentage_reasonable,
+    SUM(number_of_searches) AS number_of_searches
+FROM stop_search_mar21_mar23
+GROUP BY police_force_area,year, link
+ORDER BY year")
+force_df
+```
+
+```{r}
+force_df <- dbGetQuery(db, "
+ SELECT 
+    financial_year AS year,
+    region, 
+    legislation,
+    outcome,
+    police_force_area,
+    SUM(CASE WHEN link IN ('Linked', 'Not linked', 'Unknown link') THEN 1.0 ELSE 0 END) / NULLIF(SUM(number_of_searches), 0) * 100 AS percentage_reasonable,
+    SUM(number_of_searches) AS number_of_searches
+FROM stop_search_mar21_mar23
+GROUP BY police_force_area, year
+ORDER BY year")
+force_df
+
+```
+
+```{r}
+
+force_df_sum <- dbGetQuery(db, "
+ SELECT 
+     police_force_area,
+    SUM(ss.number_of_searches) AS number_of_searches,
+    SUM(ss.number_of_searches)/3 AS average_number_of_searches,
+    (SUM(ss.number_of_searches) * 1000.0) / 
+     (3* (SELECT SUM(REPLACE(p.Population, ',', '') + 0)FROM population_by_force_by_ethic_21census p 
+       WHERE p.`Police.Force.Area` = ss.police_force_area) )AS searches_per_1000_population,
+    (SUM(ss.number_of_searches) * 100.0) / (SELECT SUM(number_of_searches) FROM stop_search_mar21_mar23 WHERE police_force_area NOT IN ('Unknown', 'N/A - vehicle search') ) AS search_percentage,
+    SUM(CASE WHEN link IN ('Linked', 'Not linked', 'Unknown link') THEN 1.0 ELSE 0 END) / NULLIF(SUM(ss.number_of_searches), 0) * 100 AS percentage_reasonable
+FROM stop_search_mar21_mar23 ss
+WHERE police_force_area NOT IN ('Unknown', 'N/A - vehicle search') 
+GROUP BY police_force_area
+")
+force_df_sum
+
+force_df_year <- dbGetQuery(db, "
+ SELECT 
+     financial_year,
+     police_force_area,
+     
+    SUM(ss.number_of_searches) AS number_of_searches,
+    
+    (SUM(ss.number_of_searches) * 1000.0) / 
+     ((SELECT SUM(REPLACE(p.Population, ',', '') + 0)FROM population_by_force_by_ethic_21census p 
+       WHERE p.`Police.Force.Area` = ss.police_force_area) )AS searches_per_1000_population,
+       
+       (SUM(ss.number_of_searches) * 100.0) / (SELECT SUM(number_of_searches) FROM stop_search_mar21_mar23 WHERE financial_year = ss.financial_year AND police_force_area NOT IN ('Unknown', 'N/A - vehicle search') ) AS search_percentage,
+       
+    SUM(CASE WHEN link IN ('Linked', 'Not linked', 'Unknown link') THEN 1.0 ELSE 0 END) / NULLIF(SUM(ss.number_of_searches), 0) * 100 AS percentage_reasonable
+    
+FROM stop_search_mar21_mar23 ss
+WHERE police_force_area NOT IN ('Unknown', 'N/A - vehicle search') 
+GROUP BY financial_year,police_force_area
+")
+force_df_year
+```
+
+
+
+```{r,eval=FALSE}
+library(sf)
+library(dplyr)
+
+# Define the path to your folder containing KML files
+folder_path <- "force kmls"
+
+# List all KML files in the folder
+kml_files <- list.files(folder_path, pattern = "\\.kml$", full.names = TRUE)
+
+# Read all KML files and combine them into one sf object
+all_kml_data <- lapply(kml_files, st_read) %>% 
+  bind_rows()
+
+# Now you can plot all the boundaries
+ggplot() +
+  geom_sf(data = all_kml_data)
+```
+```{r}
+library(sf)
+library(dplyr)
+
+# Define the path to your folder containing KML files
+folder_path <- "force kmls"
+
+# List all KML files in the folder
+kml_files <- list.files(folder_path, pattern = "\\.kml$", full.names = TRUE)
+
+# Read all KML files, assign the file name (without .kml extension) to the 'Name' column, and combine into one sf object
+all_kml_data <- lapply(kml_files, function(file) {
+  kml_data <- st_read(file)
+  # Remove the .kml extension from the file name
+  kml_data$Name <- gsub(".kml", "", basename(file), fixed = TRUE)
+  return(kml_data)
+}) %>% bind_rows()
+
+# Now we can plot all the boundaries with names filled in
+ggplot() +
+  geom_sf(data = all_kml_data, aes(fill = Name))  # Fill based on the Name column
+
+
+```
+
+I did mutation to formalized the format for police force to ensure dataframe  `all_kml_data_update` is ready to do a join with `force_df_sum` based on the column matching ` police_force_area == Name`, so it would include "geometry" to help data virtulisatoin for a map printing.
+```{r}
+# Update the 'Name' column
+library(dplyr)
+library(stringr)
+
+all_kml_data_update <- all_kml_data %>%
+  mutate(Name = gsub("-", " ", Name),           # Replace "-" with space
+         Name = gsub(" and ", " & ", Name),     # Replace " and " with " & "
+         Name = str_to_title(Name),             # Capitalize each word
+         # Handle specific cases
+         Name = if_else(Name == "City Of London", "London, City of", Name),
+         Name = if_else(Name == "Dyfed Powys", "Dyfed-Powys", Name),
+         Name = if_else(Name == "Metropolitan", "Metropolitan Police", Name))
+
+all_kml_data_update
+
+#Now the dataframe `all_kml_data_update` is ready to do a join with `force_df_sum` based on the column matching ` police_force_area == Name`
+```
+
+
+Double check whether all of the forces in the research database could have a match of the boundary data before the join conduction. It is found the original csv file does not contain the data for North Ireland, the official boundary does not contain the geometry of British Transport Police. Therefore, I download data from the archive section of the website and did mutation to ensure it consistent with the data range of other forces. 
+```{r}
+# Unique names from all_kml_data_update
+unique_names <- unique(all_kml_data_update$Name)
+
+# Unique police_force_area from force_df_sum
+unique_police_force_areas <- unique(force_df_sum$police_force_area)
+
+# Check unmatched names in both directions
+unmatched_names_in_force_df_sum <- unique_police_force_areas[!unique_police_force_areas %in% unique_names]
+unmatched_names_in_all_kml_data_update <- unique_names[!unique_names %in% unique_police_force_areas]
+
+# Print unmatched names
+print("Unmatched Names in force_df_sum:")
+print(unmatched_names_in_force_df_sum)
+
+print("Unmatched Names in all_kml_data_update:")
+print(unmatched_names_in_all_kml_data_update)
+
+```
+
+
+The official boundary does not contain the geometry of British Transport Police. So I did a research by running a web scrapping to collect the introduction and geometry for British Transport Police from Wikipedia. But then I found it is a national special police force that polices the railway network of England, Wales and Scotland. The boundary for it is the whole GB.
+
+```{r,eval=FALSE}
+
+library(dplyr)
+library(RSelenium)
+library(rvest)
+library("netstat")
+library(stringr)
+ driver <- rsDriver(browser = "firefox",  port = free_port(random = TRUE), chromever = NULL) 
+  remDr <- driver[["client"]]
+  url<-"https://en.wikipedia.org/wiki/British_Transport_Police"
+  remDr$navigate(url)
+  
+  html <- read_html(url)
+Intro_BTP <- html%>% html_elements(css=" .mw-content-ltr > p:nth-child(5)" )
+Intro_BTP_text <- Intro_BTP %>% html_text() 
+Intro_BTP_text
+
+# Scrape Operations jurisdiction information using CSS selector
+operations_jurisdiction <- html %>% html_elements(".infobox-data")
+operations_jurisdiction <- operations_jurisdiction[html %>% html_elements(".infobox-label") %>% html_text() == "Operations jurisdiction"] %>% html_text()
+print(operations_jurisdiction)
+
+      # Scrape Headquarters coordinates using CSS selector
+      coordinates <- html %>% html_elements(".geo-default") %>% html_text()
+      coordinates <- ifelse(length(coordinates) > 0, coordinates[[1]], "N/A")
+      
+      # Extract the part after the slash and remove unnecessary characters
+coordinates <- sub(".* / ", "", coordinates)
+coordinates <- gsub("; ", " ", coordinates)
+
+print(coordinates)
+
+```
+Therefore, I would neither use the whole UK boundary to represent or use the headquarter coordinates as they are not meaningful for the research question which aim at the bias, this force operation for the whole UK hence its boundary would cover all of the land.
+
+
+```{r}
+#combine 2 dataframe together using full join
+map_to_plot<- full_join(force_df_sum , all_kml_data_update, by = c("police_force_area" = "Name"))
+
+# After the join, map_to_plot will include all rows from force_df_sum and matching rows from all_kml_data_update, including the one with empty geometry.
+
+# Filter out rows with empty geometry
+map_to_plot_filtered <- map_to_plot %>%
+  filter(!st_is_empty(geometry))
+
+# This will remove rows where the geometry is empty (including 'MULTIPOLYGON Z EMPTY')
+
+```
+
+
+
+```{r}
+library(sf)
+
+# Check if map_to_plot is still an sf object
+class(map_to_plot_filtered)
+
+# If map_to_plot is not an sf object,I  need to convert it back
+
+if (!"sf" %in% class(map_to_plot_filtered)) {
+  map_to_plot_filtered <- st_as_sf(map_to_plot_filtered)
+}
+
+# Check the class again
+class(map_to_plot_filtered)
+
+# Check rows with empty geometry
+rows_with_empty_geometry <- map_to_plot_filtered[which(st_is_empty(st_geometry(map_to_plot_filtered))), ]
+```
+
+
+```{r}
+rows_with_empty_geometry <- map_to_plot_filtered[which(st_is_empty(st_geometry(map_to_plot_filtered))), ]
+
+# Count the number of such rows
+num_rows_with_empty_geometry <- nrow(rows_with_empty_geometry)
+
+# Print the count
+print(paste("Number of rows with 'MULTIPOLYGON Z EMPTY' geometry:", num_rows_with_empty_geometry))
+
+# Optionally, view the rows with empty geometry
+if (num_rows_with_empty_geometry > 0) {
+  print(rows_with_empty_geometry$police_force_area)
+}
+
+```
+
+
+```{r}
+library("sf")
+library("tmap")
+library("classInt")
+
+
+
+plot(st_geometry(map_to_plot_filtered))
+plot(map_to_plot_filtered["average_number_of_searches"])
+
+map <- ggplot(map_to_plot_filtered) +
+  geom_sf(aes(fill=average_number_of_searches)) +
+  theme_minimal()
+map
+```
+
+```{r}
+# Identify the highest value and its index
+highest_value <- max(map_to_plot_filtered$average_number_of_searches, na.rm = TRUE)
+highest_index <- which.max(map_to_plot_filtered$average_number_of_searches)
+
+# Create a subset for the highest value area
+highest_area <- map_to_plot_filtered[highest_index, ]
+
+# Plot with ggplot
+map_rate <- ggplot(map_to_plot_filtered) +
+  geom_sf(aes(fill = average_number_of_searches), lwd = 0.2) + # Fill based on the average number of searches
+  scale_fill_viridis_c(
+    name = "Average Number of Searches",
+    option = "D",
+    limits = c(0, 40000), # Set fixed limits for the color scale
+    breaks = c(0, 10000, 20000, 30000, 40000), # Set breaks for the legend
+    oob = scales::oob_squish # Keep out-of-bounds data points
+  ) +
+  geom_sf(data = highest_area, fill = "red", lwd = 0.2) + # Overlay the highest area in red
+  labs(title = "Average Search Frequency Distribution by Police Force from 2021 to 2023",
+    caption = paste("Note: \n• The red area indicates the force area with the highest average searches from 2021 to 2023:",
+                    "City of London at", highest_value, ".\n• Grey Area indicates where stop and search data is missing due to technical issues from DATA.POLICE.UK")
+  ) +
+  theme_minimal() +
+  theme(legend.position = "right", plot.caption = element_text(hjust = 0)) +
+  annotation_scale(location = "bl")
+
+# Print the map
+print(map_rate)
+
+library("plotly")
+# ggplotly(map_rate) #interactive map plot to help discover regional difference in detail
+
+```
+```{r}
+# Identify the highest value and second highest value
+highest_value <- max(map_to_plot_filtered$searches_per_1000_population, na.rm = TRUE)
+second_highest_value <- sort(map_to_plot_filtered$searches_per_1000_population, decreasing = TRUE)[2]
+highest_location <- st_centroid(map_to_plot_filtered[which.max(map_to_plot_filtered$searches_per_1000_population), ])
+
+# Plot with ggplot
+map_rate <- ggplot(map_to_plot_filtered) +
+  geom_sf(aes(fill = searches_per_1000_population)) +
+  geom_sf(data = highest_location, color = "red", size = 3, shape = 8) + # Shape 8 is a star
+  scale_fill_viridis_c(
+    name = "Relative Search Rate per 1000 Population",
+    limits = c(0, second_highest_value),  # Set the limits excluding the highest value
+    option = "D"
+  ) +
+  labs(title = "Average Search Rate Distribution by Police Force from 2021 to 2023",
+       
+    caption = "Note: \n• The red star indicates the force area with the highest value of searches per 1000 population:City of London at 295. \n• Grey Area indicates where stop and search data is missing due to technical issues from DATA.POLICE.UK"
+  ) +
+  theme_minimal() +
+  theme(legend.position = "right", plot.caption = element_text(hjust = 0))+
+  annotation_scale(location = "bl")
+  
+
+# Print the map
+print(map_rate)
+
+library("plotly")
+#ggplotly(map_rate) #interactive map plot to help discover regional difference in detail
+
+```
+
+
+```{r}
+library(sf)
+library(dplyr)
+
+map <- tm_shape(map_to_plot_filtered) +
+  tm_polygons("average_number_of_searches")
+
+# Let's improve the map by creating more visual variation with our bins: 
+breaks <- classInt::classIntervals(map_to_plot_filtered$average_number_of_searches, n = 5, style = "jenks", dig.lab=10)
+breaks
+
+map_to_plot_filtered <- map_to_plot_filtered |>
+  mutate(number_of_searches_cut = cut(average_number_of_searches, breaks$brks, include.lowest = TRUE, dig.lab=10))
+
+map <- tm_shape(map_to_plot_filtered) +
+  tm_polygons("average_number_of_searches", palette = "Reds", title = "Number of Crimes") +
+  tm_layout(main.title = " UK Police Stop and Search, 2020-2023", legend.outside = TRUE, frame = FALSE)
+  
+map
+
+```
+
+
+```{r}
+# Finally, we can create a dynamic "live" map using tmaps:
+tmap_options(check.and.fix = TRUE) 
+tmap_mode("view")
+map
+
+tmap_save(map, "UK_stop_and_search.html")
+tmap_mode("plot")
+```
+
+
+## Appendix: All code in this assignment
+
+```{r ref.label=knitr::all_labels(), echo=TRUE, eval=FALSE} 
+# this chunk generates the complete code appendix. 
+# eval=FALSE tells R not to run (``evaluate'') the code here (it was already run before).
+```
+
+
