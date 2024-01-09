@@ -1,0 +1,2 @@
+all_data_df.csv filter=lfs diff=lfs merge=lfs -text
+database/assignment4.sqlite filter=lfs diff=lfs merge=lfs -text
