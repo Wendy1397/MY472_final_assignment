@@ -5,10 +5,10 @@ date: "AT 2023"
 output: html_document
 repository: https://github.com/Wendy1397/MY472_final_assignment.git
 
-Please Read README.md before run the code!!! This repository uses Git Large File Storage (LFS) to track large data files. Otherwise, please use the link to download data and replace them with LFS format data.
-
-
 ---
+### IMPORTANT NOTICE:
+
+Please Read README.md before run the code!!! This repository uses Git Large File Storage (LFS) to track large data files. Otherwise, please use the link to download data and replace them with LFS format data.
 
 ```{r setup, include=FALSE} 
 # this chunk contains code that sets global options for the entire .Rmd. 
