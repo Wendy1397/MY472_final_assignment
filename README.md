@@ -5,11 +5,16 @@ This is my final assignment I choose the research question one, please read READ
 This repository uses Git Large File Storage (LFS) to track large data files. To work with these files, you will need to have Git LFS installed on your system.
 
 Installing Git LFS If you do not have Git LFS installed, please follow these instructions: Download and install Git LFS from the official website. After installation, set up Git LFS by running this command in your terminal:
+
 git lfs install
 
-2. Cloning the Repository To clone the repository and download the large data files, use the following commands:
+2. Cloning the Repository
 
-git clone https://github.com/your-username/your-repository.git cd your-repository git lfs pull
+To clone the repository and download the large data files, use the following commands:
+
+git clone https://github.com/your-username/your-repository.git 
+cd your-repository 
+git lfs pull
 
 Replace https://github.com/your-username/your-repository.git with the actual URL of your repository.
 
