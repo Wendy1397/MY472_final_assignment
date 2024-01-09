@@ -30,5 +30,5 @@ the entire repository folder is available at https://drive.google.com/drive/fold
 
 After downloading the files, place them in the appropriate directory as indicated by the repository structure.
 
-3. Troubleshooting
+4. Troubleshooting
 If you encounter any issues with Git LFS, please refer to the Git LFS troubleshooting documentation, or file an issue in this repository with details of your problem.
