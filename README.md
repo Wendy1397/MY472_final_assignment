@@ -25,6 +25,7 @@ If you download the repository as a ZIP file from GitHub, the large files will n
 If you're unable to use Git and Git LFS, you can manually download the large files from the following links:
 
 all_data_df.csv <- https://drive.google.com/file/d/1-Z4one7XvNs58u3uqhcrVtUmnlkhF6NN/view?usp=share_link 
+(you could also run the code of API scraping, which may take a longer time)
 
 database/assignment4.sqlite <- https://drive.google.com/file/d/1gseJ4_9qR0U1A-MXGleDnD60T4blc7wN/view?usp=share_link
 
